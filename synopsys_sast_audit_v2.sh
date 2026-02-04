@@ -5,8 +5,8 @@ set -euo pipefail
 # Script: synopsys_sast_audit_v2.sh
 # Purpose: SAST-only audit for Synopsys integrations across pipelines + scripts.
 #
-# CSV Columns (UPDATED):
-# repo,branch,build_type,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines
+# CSV Columns:
+# repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines
 # ============================================================
 
 ROOT="${1:-.}"
@@ -55,10 +55,8 @@ INDIRECT_CONTAINER_PATTERN='docker[[:space:]]+run|container:|image:|services:|po
 
 SAST_KEYWORDS_PATTERN='polaris|coverity|synopsys|bridge|sast'
 
-# ------------------------------------------------------------
-# CSV header (FIXED: repo + added build_type)
-# ------------------------------------------------------------
-echo "repo,branch,build_type,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
+# CSV header (UPDATED)
+echo "repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
 
 # --- Safe grep wrappers ---
 grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }
@@ -69,6 +67,7 @@ csv_escape() {
   echo "$1" | sed -E 's/"/""/g' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
 }
 
+# --- Identify CI type from file path ---
 ci_type_of() {
   local f="$1"
   if [[ "$f" == *".github/workflows/"* ]]; then echo "github_actions"
@@ -80,6 +79,7 @@ ci_type_of() {
   fi
 }
 
+# --- Classify invocation style (best-effort) ---
 sast_invocation_style() {
   local f="$1"
   if grep_q 'synopsys-sig/synopsys-action' "$f"; then
@@ -97,6 +97,7 @@ sast_invocation_style() {
   fi
 }
 
+# --- Evidence lines for report (pipeline-safe) ---
 script_lines() {
   local f="$1"
   local n=8
@@ -110,6 +111,7 @@ script_lines() {
   )
 }
 
+# --- Determine found_type ---
 classify_found_type() {
   local f="$1"
 
@@ -179,128 +181,63 @@ branch_of() {
 }
 
 # ------------------------------------------------------------
-# NEW: Build type detection (maven/gradle/npm)
-# Priority: maven > gradle > npm (adjust easily if needed)
+# Repo file index for build detection (fast & accurate)
 # ------------------------------------------------------------
-build_type_of_repo() {
+repo_file_index() {
   local repo="$1"
-
-  # Prefer root-level signals first (fast), then fallback to anywhere (still cheap for shallow clone)
-  if [[ -f "$repo/pom.xml" ]] || compgen -G "$repo/**/pom.xml" > /dev/null; then
-    echo "maven"; return
-  fi
-  if [[ -f "$repo/build.gradle" || -f "$repo/build.gradle.kts" ]] || compgen -G "$repo/**/build.gradle" > /dev/null || compgen -G "$repo/**/build.gradle.kts" > /dev/null; then
-    echo "gradle"; return
-  fi
-  if [[ -f "$repo/package.json" ]] || compgen -G "$repo/**/package.json" > /dev/null; then
-    echo "npm"; return
-  fi
-
-  echo "unknown"
-}
-
-scan_files_and_report() {
-  local repo="$1"
-  local repo_url="$2"
-  local branch="$3"
-  local build_type="$4"
-  local artifact_type="$5"
-  shift 5
-  local files=("$@")
-
-  for abs in "${files[@]}"; do
-    [[ -f "$abs" ]] || continue
-    local rel="${abs#$repo/}"
-
-    [[ "$rel" == *"synopsys_sast_audit_v1.sh"* ]] && continue
-    [[ "$rel" == *"synopsys_sast_audit_v2.sh"* ]] && continue
-    [[ "$rel" == *"synopsys_sast_audit_v2.sh"* ]] && continue
-    [[ "$rel" == *"bd_detect_audit_v2.sh"* ]] && continue
-
-    local found_type
-    found_type="$(classify_found_type "$abs")"
-    [[ "$found_type" == "none" ]] && continue
-
-    local ci="n/a"
-    if [[ "$artifact_type" == "pipeline" ]]; then
-      ci="$(ci_type_of "$rel")"
-    fi
-
-    local style=""
-    if [[ "$found_type" == "direct" ]]; then
-      style="$(sast_invocation_style "$abs")"
-    fi
-
-    local ex
-    ex="$(script_lines "$abs")"
-
-    echo "[${found_type^^}] ${repo_url}@${branch} (build=$build_type) :: $rel (artifact=$artifact_type${style:+, style=$style})"
-
-    local repo_e branch_e build_e rel_e ci_e found_e style_e ex_e
-    repo_e="$(csv_escape "$repo_url")"
-    branch_e="$(csv_escape "$branch")"
-    build_e="$(csv_escape "$build_type")"
-    rel_e="$(csv_escape "$rel")"
-    ci_e="$(csv_escape "$ci")"
-    found_e="$(csv_escape "$found_type")"
-    style_e="$(csv_escape "$style")"
-    ex_e="$(csv_escape "$ex")"
-
-    echo "\"$repo_e\",\"$branch_e\",\"$build_e\",\"$artifact_type\",\"$rel_e\",\"$ci_e\",\"$found_e\",\"$style_e\",\"$ex_e\"" >> "$OUT_CSV"
-  done
-}
-
-audit_repo() {
-  local repo="$1"
-
-  local repo_url branch build_type
-  repo_url="$(repo_url_of "$repo")"
-  branch="$(branch_of "$repo")"
-  build_type="$(build_type_of_repo "$repo")"
-
-  local pipeline_files=()
-  for g in "${PIPELINE_GLOBS[@]}"; do
-    for f in "$repo"/$g; do
-      [[ -f "$f" ]] && pipeline_files+=("$f")
-    done
-  done
-  mapfile -t pipeline_files < <(printf "%s\n" "${pipeline_files[@]}" | awk '!seen[$0]++')
-
-  local wrapper_files=()
-  for g in "${WRAPPER_GLOBS[@]}"; do
-    for f in "$repo"/$g; do
-      [[ -f "$f" ]] && wrapper_files+=("$f")
-    done
-  done
-  mapfile -t wrapper_files < <(printf "%s\n" "${wrapper_files[@]}" | awk '!seen[$0]++')
-
-  if [[ ${#pipeline_files[@]} -eq 0 && ${#wrapper_files[@]} -eq 0 ]]; then
-    echo "[INFO] $(basename "$repo"): no files matched for scanning"
-    return
-  fi
-
-  if [[ ${#pipeline_files[@]} -gt 0 ]]; then
-    scan_files_and_report "$repo" "$repo_url" "$branch" "$build_type" "pipeline" "${pipeline_files[@]}"
-  fi
-  if [[ ${#wrapper_files[@]} -gt 0 ]]; then
-    scan_files_and_report "$repo" "$repo_url" "$branch" "$build_type" "wrapper_or_script" "${wrapper_files[@]}"
+  if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$repo" ls-files 2>/dev/null || true
+  else
+    (cd "$repo" && find . -type f -print 2>/dev/null | sed 's|^\./||') || true
   fi
 }
 
-echo "Writing SAST-only report to: $OUT_CSV"
-echo
+# Helpers for multi-build detection
+add_once() {
+  local val="$1"
+  local -n arr="$2"
+  local x
+  for x in "${arr[@]}"; do [[ "$x" == "$val" ]] && return 0; done
+  arr+=("$val")
+}
 
-if [[ -d "$ROOT/.git" ]]; then
-  audit_repo "$ROOT"
-else
-  for d in "$ROOT"/*; do
-    [[ -d "$d/.git" ]] || continue
-    audit_repo "$d"
-  done
-fi
+# Return first matching basename from file list and regex (priority-based)
+first_match_basename() {
+  local files="$1"
+  local regex="$2"
+  echo "$files" | grep -Ei "$regex" | head -n 1 | awk -F/ '{print $NF}'
+}
 
-echo
-echo "Done. CSV: $OUT_CSV"
-echo "Interpretation:"
-echo " - found_type=direct   => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
-echo " - found_type=indirect => likely via templates/shared libs/container; audit the referenced source"
+# ------------------------------------------------------------
+# Multi-build detection returning TWO parallel strings:
+# - build_type (joined by '+')
+# - package_manager_file (joined by '+', aligned with build_type order)
+#
+# Example:
+#   build_type=maven+npm
+#   package_manager_file=pom.xml+package.json
+# ------------------------------------------------------------
+build_info_of_repo() {
+  local repo="$1"
+  local files
+  files="$(repo_file_index "$repo")"
+  [[ -n "$files" ]] || { echo "unknown|unknown"; return; }
+
+  local types=()
+  local pm_files=()
+
+  # ---- Maven (pom.xml / mvnw) ----
+  if echo "$files" | grep -Eqi '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$'; then
+    add_once "maven" types
+    local f
+    f="$(first_match_basename "$files" '(^|/)pom\.xml$')"
+    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(mvnw|mvnw\.cmd)$')"
+    [[ -z "$f" ]] && f="pom.xml"
+    pm_files+=("$f")
+  fi
+
+  # ---- Gradle (build.gradle/kts, settings.gradle/kts, gradlew) ----
+  if echo "$files" | grep -Eqi '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$'; then
+    add_once "gradle" types
+    local f
+    f="$(first_match_basename "$files" '(^|/)(build\.gradle\.kts|build\.gradle)$')"
