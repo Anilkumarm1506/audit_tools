@@ -7,6 +7,10 @@ set -euo pipefail
 #
 # CSV Columns:
 # repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines
+#
+# Multi-branch support:
+# - When called multiple times with the same OUT_CSV, it APPENDS rows
+# - CSV header is written ONLY ONCE if the file is missing/empty
 # ============================================================
 
 ROOT="${1:-.}"
@@ -55,8 +59,12 @@ INDIRECT_CONTAINER_PATTERN='docker[[:space:]]+run|container:|image:|services:|po
 
 SAST_KEYWORDS_PATTERN='polaris|coverity|synopsys|bridge|sast'
 
-# CSV header (UPDATED)
-echo "repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
+# ------------------------------------------------------------
+# CSV header (write once; allow append for multi-branch runs)
+# ------------------------------------------------------------
+if [[ ! -s "$OUT_CSV" ]]; then
+  echo "repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
+fi
 
 # --- Safe grep wrappers ---
 grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }
@@ -67,7 +75,6 @@ csv_escape() {
   echo "$1" | sed -E 's/"/""/g' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
 }
 
-# --- Identify CI type from file path ---
 ci_type_of() {
   local f="$1"
   if [[ "$f" == *".github/workflows/"* ]]; then echo "github_actions"
@@ -79,7 +86,6 @@ ci_type_of() {
   fi
 }
 
-# --- Classify invocation style (best-effort) ---
 sast_invocation_style() {
   local f="$1"
   if grep_q 'synopsys-sig/synopsys-action' "$f"; then
@@ -97,7 +103,6 @@ sast_invocation_style() {
   fi
 }
 
-# --- Evidence lines for report (pipeline-safe) ---
 script_lines() {
   local f="$1"
   local n=8
@@ -111,7 +116,6 @@ script_lines() {
   )
 }
 
-# --- Determine found_type ---
 classify_found_type() {
   local f="$1"
 
@@ -132,7 +136,6 @@ classify_found_type() {
   echo "none"
 }
 
-# --- Normalize GitHub URL (ssh -> https) best effort ---
 normalize_repo_url() {
   local url="${1:-}"
   if [[ "$url" =~ ^git@github\.com:(.+)\.git$ ]]; then
@@ -180,9 +183,6 @@ branch_of() {
   [[ -n "$b" && "$b" != "undefined" ]] && echo "$b" || echo "unknown"
 }
 
-# ------------------------------------------------------------
-# Repo file index for build detection (fast & accurate)
-# ------------------------------------------------------------
 repo_file_index() {
   local repo="$1"
   if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -192,7 +192,6 @@ repo_file_index() {
   fi
 }
 
-# Helpers for multi-build detection
 add_once() {
   local val="$1"
   local -n arr="$2"
@@ -201,43 +200,11 @@ add_once() {
   arr+=("$val")
 }
 
-# Return first matching basename from file list and regex (priority-based)
 first_match_basename() {
   local files="$1"
   local regex="$2"
   echo "$files" | grep -Ei "$regex" | head -n 1 | awk -F/ '{print $NF}'
 }
 
-# ------------------------------------------------------------
-# Multi-build detection returning TWO parallel strings:
-# - build_type (joined by '+')
-# - package_manager_file (joined by '+', aligned with build_type order)
-#
-# Example:
-#   build_type=maven+npm
-#   package_manager_file=pom.xml+package.json
-# ------------------------------------------------------------
+# Returns "build_type|package_manager_file" (both may be '+ joined')
 build_info_of_repo() {
-  local repo="$1"
-  local files
-  files="$(repo_file_index "$repo")"
-  [[ -n "$files" ]] || { echo "unknown|unknown"; return; }
-
-  local types=()
-  local pm_files=()
-
-  # ---- Maven (pom.xml / mvnw) ----
-  if echo "$files" | grep -Eqi '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$'; then
-    add_once "maven" types
-    local f
-    f="$(first_match_basename "$files" '(^|/)pom\.xml$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(mvnw|mvnw\.cmd)$')"
-    [[ -z "$f" ]] && f="pom.xml"
-    pm_files+=("$f")
-  fi
-
-  # ---- Gradle (build.gradle/kts, settings.gradle/kts, gradlew) ----
-  if echo "$files" | grep -Eqi '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$'; then
-    add_once "gradle" types
-    local f
-    f="$(first_match_basename "$files" '(^|/)(build\.gradle\.kts|build\.gradle)$')"
