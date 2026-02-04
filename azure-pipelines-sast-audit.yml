@@ -46,10 +46,10 @@ steps:
 
 
       echo "Make audit script executable..."
-      chmod +x synopsys_sast_audit_v1.sh
+      chmod +x synopsys_sast_audit_v2.sh
 
       echo "Run SAST-only audit with tracing..."
-      bash -x synopsys_sast_audit_v1.sh "target-repo" "${{ parameters.outputCsvName }}"
+      bash -x synopsys_sast_audit_v2.sh "target-repo" "${{ parameters.outputCsvName }}"
 
       echo "Preview CSV:"
       head -n 30 "${{ parameters.outputCsvName }}" || true
