@@ -1,0 +1,70 @@
+trigger: none
+pr: none
+
+parameters:
+  - name: targetRepoUrl
+    type: string
+    default: ''
+
+  - name: targetBranch
+    type: string
+    default: ''
+
+  - name: outputCsvName
+    type: string
+    default: 'synopsys_sast_audit.csv'
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  # 1) Checkout the audit repo (this repo) so we can access tools/synopsys_sast_audit_v1.sh
+  - checkout: self
+    fetchDepth: 1
+
+  # 2) Clone the target Git repo at requested branch
+  - bash: |
+      set -euo pipefail
+      cd "$(Build.SourcesDirectory)"
+
+      echo "Target repo URL : ${{ parameters.targetRepoUrl }}"
+      echo "Target repo branch: ${{ parameters.targetBranch }}"
+
+      rm -rf target-repo
+
+      # Shallow clone is enough for file scanning
+      git clone --depth 1 --branch "${{ parameters.targetBranch }}" "${{ parameters.targetRepoUrl }}" target-repo
+
+      echo "Clone complete. Top-level files:"
+      ls -la target-repo | head -n 50 || true
+    displayName: "Clone target repo (repo+branch parameterized)"
+
+  # 3) Run SAST-only audit against cloned repo
+  - bash: |
+      set -euo pipefail
+      cd "$(Build.SourcesDirectory)"
+
+      echo "Listing tools folder:"
+      ls -la tools || true
+
+      echo "Make audit script executable..."
+      chmod +x tools/synopsys_sast_audit_v1.sh
+
+      echo "Run SAST-only audit with tracing..."
+      bash -x ./tools/synopsys_sast_audit_v1.sh "target-repo" "${{ parameters.outputCsvName }}"
+
+      echo "Preview CSV:"
+      head -n 30 "${{ parameters.outputCsvName }}" || true
+
+      echo "Count of DIRECT findings (rule: found_type=direct only):"
+      grep -c ',direct,' "${{ parameters.outputCsvName }}" || true
+    displayName: "Run Synopsys SAST Audit (SAST-only)"
+
+  # 4) Publish the audit CSV always
+  - task: PublishPipelineArtifact@1
+    condition: always()
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/${{ parameters.outputCsvName }}'
+      artifact: 'synopsys-sast-audit-report'
+      publishLocation: 'pipeline'
+    displayName: "Publish audit CSV artifact (always)"
