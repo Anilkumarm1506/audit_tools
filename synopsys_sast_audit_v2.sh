@@ -13,8 +13,8 @@ set -euo pipefail
 # - CSV header is written ONLY ONCE if the file is missing/empty
 #
 # Build detection:
-# - Build marker discovery includes tracked + untracked (non-ignored) files:
-#   git ls-files --cached --others --exclude-standard
+# - Uses git ls-files (tracked + untracked non-ignored) for speed
+# - Adds targeted filesystem fallback to detect marker files even if gitignored
 # ============================================================
 
 ROOT="${1:-.}"
@@ -85,11 +85,11 @@ if [[ ! -s "$OUT_CSV" ]]; then
   echo "repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
 fi
 
-# --- Safe grep wrappers (prevent invalid option + avoid pipefail crashes) ---
-grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }           # quiet true/false
-grep_in() { grep -Ein "$1" -- "$2" 2>/dev/null || true; } # numbered output, never fails
+# --- Safe grep wrappers ---
+grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }
+grep_in() { grep -Ein "$1" -- "$2" 2>/dev/null || true; }
 
-# --- CSV sanitize (escape quotes, collapse newlines) ---
+# --- CSV sanitize ---
 csv_escape() {
   echo "$1" | sed -E 's/"/""/g' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
 }
@@ -142,24 +142,18 @@ script_lines() {
 classify_found_type() {
   local f="$1"
 
-  # Direct = visible SAST invocation or task/action/config
   if grep_q "$DIRECT_SAST_PATTERN" "$f"; then
-    echo "direct"
-    return
+    echo "direct"; return
   fi
 
-  # Indirect = templates/shared libs/containers with SAST keywords
   if grep_q "$INDIRECT_TEMPLATE_PATTERN" "$f" && grep_q "$SAST_KEYWORDS_PATTERN" "$f"; then
-    echo "indirect"
-    return
+    echo "indirect"; return
   fi
   if grep_q "$INDIRECT_JENKINS_LIB_PATTERN" "$f"; then
-    echo "indirect"
-    return
+    echo "indirect"; return
   fi
   if grep_q "$INDIRECT_CONTAINER_PATTERN" "$f" && grep_q "$SAST_KEYWORDS_PATTERN" "$f"; then
-    echo "indirect"
-    return
+    echo "indirect"; return
   fi
 
   echo "none"
@@ -169,21 +163,17 @@ classify_found_type() {
 normalize_repo_url() {
   local url="${1:-}"
   if [[ "$url" =~ ^git@github\.com:(.+)\.git$ ]]; then
-    echo "https://github.com/${BASH_REMATCH[1]}"
-    return
+    echo "https://github.com/${BASH_REMATCH[1]}"; return
   fi
   if [[ "$url" =~ ^ssh://git@github\.com/(.+)\.git$ ]]; then
-    echo "https://github.com/${BASH_REMATCH[1]}"
-    return
+    echo "https://github.com/${BASH_REMATCH[1]}"; return
   fi
   if [[ "$url" =~ ^https://github\.com/(.+)\.git$ ]]; then
-    echo "https://github.com/${BASH_REMATCH[1]}"
-    return
+    echo "https://github.com/${BASH_REMATCH[1]}"; return
   fi
   echo "$url"
 }
 
-# --- Repo URL from git origin (fallback to folder name if missing) ---
 repo_url_of() {
   local repo="$1"
   local url=""
@@ -197,7 +187,6 @@ repo_url_of() {
   fi
 }
 
-# --- Branch best-effort (handles detached head) ---
 branch_of() {
   local repo="$1"
   local b=""
@@ -219,8 +208,8 @@ branch_of() {
 }
 
 # ------------------------------------------------------------
-# Repo file index for build detection:
-# - tracked + untracked (non-ignored) so we don't miss build markers
+# Repo file index:
+# - tracked + untracked (excluding ignored) for speed & sanity
 # ------------------------------------------------------------
 repo_file_index() {
   local repo="$1"
@@ -231,7 +220,54 @@ repo_file_index() {
   fi
 }
 
-# Helpers
+# ------------------------------------------------------------
+# Targeted fallback search for marker files even if gitignored.
+# Avoids heavy directories and .git.
+# Returns first match relative path or empty.
+# ------------------------------------------------------------
+find_first_marker_path() {
+  local repo="$1"
+  shift
+  local -a names=("$@")
+
+  ( cd "$repo" && \
+    find . -type f \
+      -not -path './.git/*' \
+      -not -path '*/.git/*' \
+      -not -path '*/node_modules/*' \
+      -not -path '*/.gradle/*' \
+      -not -path '*/target/*' \
+      -not -path '*/build/*' \
+      \( $(printf -- '-name %q -o ' "${names[@]}" | sed 's/ -o $//') \) \
+      -print 2>/dev/null | head -n 1 | sed 's|^\./||' ) || true
+}
+
+# Basename match from git-index; if missing, try filesystem fallback
+first_match_basename_with_fallback() {
+  local repo="$1"
+  local files="$2"
+  local regex="$3"
+  shift 3
+  local -a fallback_names=("$@")
+
+  local b=""
+  b="$(echo "$files" | grep -Ei "$regex" | head -n 1 | awk -F/ '{print $NF}')"
+  if [[ -n "$b" ]]; then
+    echo "$b"
+    return
+  fi
+
+  local p=""
+  p="$(find_first_marker_path "$repo" "${fallback_names[@]}")"
+  if [[ -n "$p" ]]; then
+    echo "$(basename "$p")"
+    return
+  fi
+
+  echo ""
+}
+
+# Helpers for multi-build detection
 add_once() {
   local val="$1"
   local -n arr="$2"
@@ -240,16 +276,10 @@ add_once() {
   arr+=("$val")
 }
 
-first_match_basename() {
-  local files="$1"
-  local regex="$2"
-  echo "$files" | grep -Ei "$regex" | head -n 1 | awk -F/ '{print $NF}'
-}
-
 # ------------------------------------------------------------
 # Multi-build detection returning:
 # build_type|package_manager_file
-# (both may be '+' joined and aligned)
+# Both may be '+' joined and aligned
 # ------------------------------------------------------------
 build_info_of_repo() {
   local repo="$1"
@@ -261,158 +291,172 @@ build_info_of_repo() {
   local pm_files=()
 
   # Maven
-  if echo "$files" | grep -Eqi '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$'; then
+  if echo "$files" | grep -Eqi '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "pom.xml" "mvnw" "mvnw.cmd")" ]]; then
     add_once "maven" types
     local f
-    f="$(first_match_basename "$files" '(^|/)pom\.xml$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(mvnw|mvnw\.cmd)$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pom\.xml$' "pom.xml")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(mvnw|mvnw\.cmd)$' "mvnw" "mvnw.cmd")"
     [[ -z "$f" ]] && f="pom.xml"
     pm_files+=("$f")
   fi
 
   # Gradle
-  if echo "$files" | grep -Eqi '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "build.gradle" "build.gradle.kts" "settings.gradle" "settings.gradle.kts" "gradle.properties" "gradlew" "gradlew.bat")" ]]; then
     add_once "gradle" types
     local f
-    f="$(first_match_basename "$files" '(^|/)(build\.gradle\.kts|build\.gradle)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(settings\.gradle\.kts|settings\.gradle)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(gradlew|gradlew\.bat)$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(build\.gradle\.kts|build\.gradle)$' "build.gradle.kts" "build.gradle")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(settings\.gradle\.kts|settings\.gradle)$' "settings.gradle.kts" "settings.gradle")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(gradlew|gradlew\.bat)$' "gradlew" "gradlew.bat")"
     [[ -z "$f" ]] && f="build.gradle"
     pm_files+=("$f")
   fi
 
-  # npm ecosystem
-  if echo "$files" | grep -Eqi '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$'; then
+  # npm ecosystem  ✅ (this fixes your cli branch case)
+  if echo "$files" | grep -Eqi '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "package.json" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "pnpm-lock.yml" "pnpm-workspace.yaml" "pnpm-workspace.yml")" ]]; then
     add_once "npm" types
     local f
-    f="$(first_match_basename "$files" '(^|/)package\.json$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(pnpm-lock\.ya?ml|yarn\.lock|package-lock\.json)$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)package\.json$' "package.json")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(pnpm-lock\.ya?ml|yarn\.lock|package-lock\.json)$' "pnpm-lock.yaml" "pnpm-lock.yml" "yarn.lock" "package-lock.json")"
     [[ -z "$f" ]] && f="package.json"
     pm_files+=("$f")
   fi
 
-  # docker marker
-  if echo "$files" | grep -Eqi '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$'; then
+  # Docker ✅
+  if echo "$files" | grep -Eqi '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Dockerfile" "docker-compose.yml" "docker-compose.yaml")" ]]; then
     add_once "docker" types
     local f
-    f="$(first_match_basename "$files" '(^|/)Dockerfile$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)docker-compose\.ya?ml$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Dockerfile$' "Dockerfile")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)docker-compose\.ya?ml$' "docker-compose.yml" "docker-compose.yaml")"
     [[ -z "$f" ]] && f="Dockerfile"
     pm_files+=("$f")
   fi
 
   # .NET
-  if echo "$files" | grep -Eqi '(\.sln|\.csproj|\.fsproj|\.vbproj)$|(^|/)(global\.json|Directory\.Build\.props|Directory\.Build\.targets|nuget\.config|packages\.config)$'; then
+  if echo "$files" | grep -Eqi '(\.sln|\.csproj|\.fsproj|\.vbproj)$|(^|/)(global\.json|Directory\.Build\.props|Directory\.Build\.targets|nuget\.config|packages\.config)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "global.json" "Directory.Build.props" "Directory.Build.targets" "nuget.config" "packages.config")" ]]; then
     add_once "dotnet" types
     local f
-    f="$(first_match_basename "$files" '(\.sln)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(\.(csproj|fsproj|vbproj))$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)global\.json$')"
+    f="$(echo "$files" | grep -Ei '(\.sln)$' | head -n 1 | awk -F/ '{print $NF}' || true)"
+    [[ -z "$f" ]] && f="$(echo "$files" | grep -Ei '(\.(csproj|fsproj|vbproj))$' | head -n 1 | awk -F/ '{print $NF}' || true)"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)global\.json$' "global.json")"
     [[ -z "$f" ]] && f="*.csproj"
     pm_files+=("$f")
   fi
 
   # Python
-  if echo "$files" | grep -Eqi '(^|/)(pyproject\.toml|poetry\.lock|Pipfile|Pipfile\.lock|setup\.py|setup\.cfg|requirements(\-[a-z0-9_-]+)?\.txt|requirements\.in|tox\.ini|environment\.ya?ml|conda\.ya?ml)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(pyproject\.toml|poetry\.lock|Pipfile|Pipfile\.lock|setup\.py|setup\.cfg|requirements(\-[a-z0-9_-]+)?\.txt|requirements\.in|tox\.ini|environment\.ya?ml|conda\.ya?ml)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "pyproject.toml" "poetry.lock" "Pipfile" "Pipfile.lock" "setup.py" "setup.cfg" "requirements.txt" "requirements.in" "tox.ini" "environment.yml" "environment.yaml" "conda.yml" "conda.yaml")" ]]; then
     add_once "python" types
     local f
-    f="$(first_match_basename "$files" '(^|/)pyproject\.toml$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(poetry\.lock|Pipfile\.lock|Pipfile)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)requirements(\-[a-z0-9_-]+)?\.txt$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)requirements\.in$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pyproject\.toml$' "pyproject.toml")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(poetry\.lock|Pipfile\.lock|Pipfile)$' "poetry.lock" "Pipfile.lock" "Pipfile")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)requirements(\-[a-z0-9_-]+)?\.txt$' "requirements.txt")"
     [[ -z "$f" ]] && f="pyproject.toml"
     pm_files+=("$f")
   fi
 
   # Go
-  if echo "$files" | grep -Eqi '(^|/)(go\.mod|go\.sum|go\.work|go\.work\.sum)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(go\.mod|go\.sum|go\.work|go\.work\.sum)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "go.mod" "go.sum" "go.work" "go.work.sum")" ]]; then
     add_once "go" types
     local f
-    f="$(first_match_basename "$files" '(^|/)go\.mod$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)go\.work$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)go\.mod$' "go.mod")"
+    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)go\.work$' "go.work")"
     [[ -z "$f" ]] && f="go.mod"
     pm_files+=("$f")
   fi
 
   # Rust
-  if echo "$files" | grep -Eqi '(^|/)(Cargo\.toml|Cargo\.lock)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(Cargo\.toml|Cargo\.lock)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Cargo.toml" "Cargo.lock")" ]]; then
     add_once "rust" types
     local f
-    f="$(first_match_basename "$files" '(^|/)Cargo\.toml$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Cargo\.toml$' "Cargo.toml")"
     [[ -z "$f" ]] && f="Cargo.toml"
     pm_files+=("$f")
   fi
 
   # PHP
-  if echo "$files" | grep -Eqi '(^|/)(composer\.json|composer\.lock)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(composer\.json|composer\.lock)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "composer.json" "composer.lock")" ]]; then
     add_once "php" types
     local f
-    f="$(first_match_basename "$files" '(^|/)composer\.json$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)composer\.json$' "composer.json")"
     [[ -z "$f" ]] && f="composer.json"
     pm_files+=("$f")
   fi
 
   # Ruby
-  if echo "$files" | grep -Eqi '(^|/)(Gemfile|Gemfile\.lock|Rakefile|\.ruby-version)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(Gemfile|Gemfile\.lock|Rakefile|\.ruby-version)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Gemfile" "Gemfile.lock" "Rakefile" ".ruby-version")" ]]; then
     add_once "ruby" types
     local f
-    f="$(first_match_basename "$files" '(^|/)Gemfile$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Gemfile$' "Gemfile")"
     [[ -z "$f" ]] && f="Gemfile"
     pm_files+=("$f")
   fi
 
   # Dart
-  if echo "$files" | grep -Eqi '(^|/)(pubspec\.ya?ml|pubspec\.lock)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(pubspec\.ya?ml|pubspec\.lock)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "pubspec.yaml" "pubspec.yml" "pubspec.lock")" ]]; then
     add_once "dart" types
     local f
-    f="$(first_match_basename "$files" '(^|/)pubspec\.ya?ml$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pubspec\.ya?ml$' "pubspec.yaml" "pubspec.yml")"
     [[ -z "$f" ]] && f="pubspec.yaml"
     pm_files+=("$f")
   fi
 
   # SwiftPM
-  if echo "$files" | grep -Eqi '(^|/)Package\.swift$'; then
+  if echo "$files" | grep -Eqi '(^|/)Package\.swift$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Package.swift")" ]]; then
     add_once "swift" types
     pm_files+=("Package.swift")
   fi
 
   # iOS markers
-  if echo "$files" | grep -Eqi '(\.xcodeproj/|\.xcworkspace/)|(^|/)(Podfile|Podfile\.lock|Cartfile|Cartfile\.resolved)$'; then
+  if echo "$files" | grep -Eqi '(\.xcodeproj/|\.xcworkspace/)|(^|/)(Podfile|Podfile\.lock|Cartfile|Cartfile\.resolved)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Podfile" "Podfile.lock" "Cartfile" "Cartfile.resolved")" ]]; then
     add_once "ios" types
     local f
-    f="$(first_match_basename "$files" '(^|/)(Podfile|Cartfile)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(\.xcodeproj/|\.xcworkspace/)')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(Podfile|Cartfile)$' "Podfile" "Cartfile")"
     [[ -z "$f" ]] && f="Podfile"
     pm_files+=("$f")
   fi
 
   # Android marker
-  if echo "$files" | grep -Eqi '(^|/)AndroidManifest\.xml$'; then
+  if echo "$files" | grep -Eqi '(^|/)AndroidManifest\.xml$' \
+     || [[ -n "$(find_first_marker_path "$repo" "AndroidManifest.xml")" ]]; then
     add_once "android" types
     pm_files+=("AndroidManifest.xml")
   fi
 
   # Bazel marker
-  if echo "$files" | grep -Eqi '(^|/)(WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|BUILD|BUILD\.bazel|\.bazelrc|bazel\.rc)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|BUILD|BUILD\.bazel|\.bazelrc|bazel\.rc)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "WORKSPACE" "WORKSPACE.bazel" "MODULE.bazel" "BUILD" "BUILD.bazel" ".bazelrc" "bazel.rc")" ]]; then
     add_once "bazel" types
     local f
-    f="$(first_match_basename "$files" '(^|/)(MODULE\.bazel|WORKSPACE\.bazel|WORKSPACE)$')"
-    [[ -z "$f" ]] && f="$(first_match_basename "$files" '(^|/)(BUILD\.bazel|BUILD)$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(MODULE\.bazel|WORKSPACE\.bazel|WORKSPACE)$' "MODULE.bazel" "WORKSPACE.bazel" "WORKSPACE")"
     [[ -z "$f" ]] && f="WORKSPACE"
     pm_files+=("$f")
   fi
 
   # CMake
-  if echo "$files" | grep -Eqi '(^|/)CMakeLists\.txt$'; then
+  if echo "$files" | grep -Eqi '(^|/)CMakeLists\.txt$' \
+     || [[ -n "$(find_first_marker_path "$repo" "CMakeLists.txt")" ]]; then
     add_once "cmake" types
     pm_files+=("CMakeLists.txt")
   fi
 
   # Make
-  if echo "$files" | grep -Eqi '(^|/)(Makefile|makefile|GNUmakefile)$'; then
+  if echo "$files" | grep -Eqi '(^|/)(Makefile|makefile|GNUmakefile)$' \
+     || [[ -n "$(find_first_marker_path "$repo" "Makefile" "makefile" "GNUmakefile")" ]]; then
     add_once "make" types
     local f
-    f="$(first_match_basename "$files" '(^|/)(Makefile|makefile|GNUmakefile)$')"
+    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(Makefile|makefile|GNUmakefile)$' "Makefile" "makefile" "GNUmakefile")"
     [[ -z "$f" ]] && f="Makefile"
     pm_files+=("$f")
   fi
@@ -549,4 +593,3 @@ echo "Done. CSV: $OUT_CSV"
 echo "Interpretation:"
 echo " - found_type=direct   => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
 echo " - found_type=indirect => likely via templates/shared libs/container; audit the referenced source"
-``
