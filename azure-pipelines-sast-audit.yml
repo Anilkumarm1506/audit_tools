@@ -34,7 +34,7 @@ steps:
       echo
 
       # Script used (make sure this file exists in the audit repo)
-      chmod +x ynopsys_sast_audit_v2.sh
+      chmod +x synopsys_sast_audit_v2.sh
 
       # Start fresh each pipeline run
       rm -f "${{ parameters.outputCsvName }}"
