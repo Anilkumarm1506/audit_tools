@@ -18,7 +18,7 @@ pool:
   vmImage: ubuntu-latest
 
 steps:
-  # 1) Checkout the audit repo (this repo) so we can access tools/synopsys_sast_audit_v1.sh
+  # 1) Checkout the audit repo (this repo) so we can access synopsys_sast_audit_v1.sh
   - checkout: self
     fetchDepth: 1
 
@@ -44,14 +44,12 @@ steps:
       set -euo pipefail
       cd "$(Build.SourcesDirectory)"
 
-      echo "Listing tools folder:"
-      ls -la tools || true
 
       echo "Make audit script executable..."
-      chmod +x tools/synopsys_sast_audit_v1.sh
+      chmod +x synopsys_sast_audit_v1.sh
 
       echo "Run SAST-only audit with tracing..."
-      bash -x ./tools/synopsys_sast_audit_v1.sh "target-repo" "${{ parameters.outputCsvName }}"
+      bash -x synopsys_sast_audit_v1.sh "target-repo" "${{ parameters.outputCsvName }}"
 
       echo "Preview CSV:"
       head -n 30 "${{ parameters.outputCsvName }}" || true
