@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_sast_audit_v1.sh
+# Script: synopsys_sast_audit_v2.sh
 # Purpose:
 # SAST-only audit for Synopsys integrations across pipelines + scripts.
 # Focus: Polaris / Coverity on Polaris / Bridge CLI / Synopsys Action
@@ -13,13 +13,17 @@ set -euo pipefail
 # - CSV report (default: synopsys_sast_audit.csv)
 #
 # Usage:
-# ./synopsys_sast_audit_v1.sh # current repo
-# ./synopsys_sast_audit_v1.sh . out.csv # custom CSV
-# ./synopsys_sast_audit_v1.sh /repos out.csv # all git repos in folder
+# ./synopsys_sast_audit_v2.sh                 # current repo
+# ./synopsys_sast_audit_v2.sh . out.csv       # custom CSV
+# ./synopsys_sast_audit_v2.sh /repos out.csv  # all git repos in folder
+#
+# CSV Columns:
+# repo_url,branch,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines
 #
 # Notes:
 # - Pipeline-safe: grep "no match" will not fail
 # - Grep-safe: always uses `--` before file
+# - Repo URL/branch derived from git metadata (origin + HEAD)
 # ============================================================
 
 ROOT="${1:-.}"
@@ -84,13 +88,20 @@ INDIRECT_CONTAINER_PATTERN='docker[[:space:]]+run|container:|image:|services:|po
 SAST_KEYWORDS_PATTERN='polaris|coverity|synopsys|bridge|sast'
 
 # ------------------------------------------------------------
-# CSV header
+# CSV header (UPDATED)
 # ------------------------------------------------------------
-echo "repo,artifact_type,file_path,ci_type,found_type,approach,invocation_style,example_lines" > "$OUT_CSV"
+echo "repo_url,branch,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
 
 # --- Safe grep wrappers (prevent invalid option + avoid pipefail crashes) ---
-grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; } # quiet true/false
+grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }          # quiet true/false
 grep_in() { grep -Ein "$1" -- "$2" 2>/dev/null || true; } # numbered output, never fails
+
+# --- CSV sanitize (escape quotes, collapse newlines) ---
+csv_escape() {
+  # Escape double-quotes for CSV, keep as one line
+  # shellcheck disable=SC2001
+  echo "$1" | sed -E 's/"/""/g' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
+}
 
 # --- Identify CI type from file path ---
 ci_type_of() {
@@ -123,7 +134,7 @@ sast_invocation_style() {
 }
 
 # --- Evidence lines for report (pipeline-safe) ---
-example_lines() {
+script_lines() {
   local f="$1"
   local n=8
   local pat="$DIRECT_SAST_PATTERN|$INDIRECT_TEMPLATE_PATTERN|$INDIRECT_JENKINS_LIB_PATTERN|$INDIRECT_CONTAINER_PATTERN"
@@ -136,39 +147,100 @@ example_lines() {
   )
 }
 
-# --- Determine found_type + approach (SAST-only) ---
-classify_found() {
+# --- Determine found_type (SAST-only). Approach removed from CSV by request ---
+classify_found_type() {
   local f="$1"
 
   # Direct = visible SAST invocation or task/action/config
   if grep_q "$DIRECT_SAST_PATTERN" "$f"; then
-    echo "direct,sast_present"
+    echo "direct"
     return
   fi
 
   # Indirect = templates/shared libs/containers with SAST keywords
   if grep_q "$INDIRECT_TEMPLATE_PATTERN" "$f" && grep_q "$SAST_KEYWORDS_PATTERN" "$f"; then
-    echo "indirect,template_or_reusable_workflow"
+    echo "indirect"
     return
   fi
   if grep_q "$INDIRECT_JENKINS_LIB_PATTERN" "$f"; then
-    echo "indirect,jenkins_shared_library_or_wrapper"
+    echo "indirect"
     return
   fi
   if grep_q "$INDIRECT_CONTAINER_PATTERN" "$f" && grep_q "$SAST_KEYWORDS_PATTERN" "$f"; then
-    echo "indirect,container_based_scan"
+    echo "indirect"
     return
   fi
 
-  echo "none,none"
+  echo "none"
+}
+
+# --- Normalize GitHub URL (ssh -> https) best effort ---
+normalize_repo_url() {
+  local url="${1:-}"
+  # git@github.com:org/repo.git -> https://github.com/org/repo
+  if [[ "$url" =~ ^git@github\.com:(.+)\.git$ ]]; then
+    echo "https://github.com/${BASH_REMATCH[1]}"
+    return
+  fi
+  # ssh://git@github.com/org/repo.git -> https://github.com/org/repo
+  if [[ "$url" =~ ^ssh://git@github\.com/(.+)\.git$ ]]; then
+    echo "https://github.com/${BASH_REMATCH[1]}"
+    return
+  fi
+  # https://github.com/org/repo.git -> https://github.com/org/repo
+  if [[ "$url" =~ ^https://github\.com/(.+)\.git$ ]]; then
+    echo "https://github.com/${BASH_REMATCH[1]}"
+    return
+  fi
+  # leave as-is (Azure Repos, GitLab, Bitbucket, etc.)
+  echo "$url"
+}
+
+# --- Repo URL from git origin (fallback to folder name if missing) ---
+repo_url_of() {
+  local repo="$1"
+  local url=""
+  if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    url="$(git -C "$repo" config --get remote.origin.url 2>/dev/null || true)"
+  fi
+  if [[ -z "$url" ]]; then
+    echo "$(basename "$repo")"
+  else
+    normalize_repo_url "$url"
+  fi
+}
+
+# --- Branch best-effort (handles detached head) ---
+branch_of() {
+  local repo="$1"
+  local b=""
+
+  if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # Prefer explicit current branch
+    b="$(git -C "$repo" branch --show-current 2>/dev/null || true)"
+    if [[ -z "$b" ]]; then
+      # symbolic-ref fails on detached HEAD
+      b="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    fi
+    if [[ -z "$b" || "$b" == "HEAD" ]]; then
+      # Try to infer from name-rev (e.g., remotes/origin/main)
+      b="$(git -C "$repo" name-rev --name-only --no-undefined HEAD 2>/dev/null || true)"
+      b="${b#remotes/origin/}"
+      b="${b#origin/}"
+      b="${b%%^*}"
+    fi
+  fi
+
+  [[ -n "$b" && "$b" != "undefined" ]] && echo "$b" || echo "unknown"
 }
 
 # --- Scan file list and append to CSV ---
 scan_files_and_report() {
   local repo="$1"
-  local repobase="$2"
-  local artifact_type="$3"
-  shift 3
+  local repo_url="$2"
+  local branch="$3"
+  local artifact_type="$4"
+  shift 4
   local files=("$@")
 
   for abs in "${files[@]}"; do
@@ -177,13 +249,11 @@ scan_files_and_report() {
 
     # Skip scanning the audit tool itself (prevents self-match)
     [[ "$rel" == *"synopsys_sast_audit_v1.sh"* ]] && continue
+    [[ "$rel" == *"synopsys_sast_audit_v2.sh"* ]] && continue
     [[ "$rel" == *"bd_detect_audit_v2.sh"* ]] && continue
 
-    local cls found_type approach
-    cls="$(classify_found "$abs")"
-    found_type="${cls%%,*}"
-    approach="${cls#*,}"
-
+    local found_type
+    found_type="$(classify_found_type "$abs")"
     [[ "$found_type" == "none" ]] && continue
 
     local ci="n/a"
@@ -197,17 +267,31 @@ scan_files_and_report() {
     fi
 
     local ex
-    ex="$(example_lines "$abs")"
+    ex="$(script_lines "$abs")"
 
-    echo "[${found_type^^}] $repobase :: $rel (artifact=$artifact_type, approach=$approach${style:+, style=$style})"
-    echo "\"$repobase\",\"$artifact_type\",\"$rel\",\"$ci\",\"$found_type\",\"$approach\",\"$style\",\"$ex\"" >> "$OUT_CSV"
+    # Console summary
+    echo "[${found_type^^}] ${repo_url}@${branch} :: $rel (artifact=$artifact_type${style:+, style=$style})"
+
+    # CSV row (UPDATED columns)
+    local repo_url_e branch_e rel_e ci_e found_e style_e ex_e
+    repo_url_e="$(csv_escape "$repo_url")"
+    branch_e="$(csv_escape "$branch")"
+    rel_e="$(csv_escape "$rel")"
+    ci_e="$(csv_escape "$ci")"
+    found_e="$(csv_escape "$found_type")"
+    style_e="$(csv_escape "$style")"
+    ex_e="$(csv_escape "$ex")"
+
+    echo "\"$repo_url_e\",\"$branch_e\",\"$artifact_type\",\"$rel_e\",\"$ci_e\",\"$found_e\",\"$style_e\",\"$ex_e\"" >> "$OUT_CSV"
   done
 }
 
 audit_repo() {
   local repo="$1"
-  local repobase
-  repobase="$(basename "$repo")"
+
+  local repo_url branch
+  repo_url="$(repo_url_of "$repo")"
+  branch="$(branch_of "$repo")"
 
   local pipeline_files=()
   for g in "${PIPELINE_GLOBS[@]}"; do
@@ -226,15 +310,15 @@ audit_repo() {
   mapfile -t wrapper_files < <(printf "%s\n" "${wrapper_files[@]}" | awk '!seen[$0]++')
 
   if [[ ${#pipeline_files[@]} -eq 0 && ${#wrapper_files[@]} -eq 0 ]]; then
-    echo "[INFO] $repobase: no files matched for scanning"
+    echo "[INFO] $(basename "$repo"): no files matched for scanning"
     return
   fi
 
   if [[ ${#pipeline_files[@]} -gt 0 ]]; then
-    scan_files_and_report "$repo" "$repobase" "pipeline" "${pipeline_files[@]}"
+    scan_files_and_report "$repo" "$repo_url" "$branch" "pipeline" "${pipeline_files[@]}"
   fi
   if [[ ${#wrapper_files[@]} -gt 0 ]]; then
-    scan_files_and_report "$repo" "$repobase" "wrapper_or_script" "${wrapper_files[@]}"
+    scan_files_and_report "$repo" "$repo_url" "$branch" "wrapper_or_script" "${wrapper_files[@]}"
   fi
 }
 
@@ -253,5 +337,5 @@ fi
 echo
 echo "Done. CSV: $OUT_CSV"
 echo "Interpretation:"
-echo " - found_type=direct => Synopsys SAST integration is visible (Polaris/Coverity/Bridge/task/action)"
+echo " - found_type=direct   => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
 echo " - found_type=indirect => likely via templates/shared libs/container; audit the referenced source"
