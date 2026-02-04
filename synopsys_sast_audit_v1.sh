@@ -13,9 +13,9 @@ set -euo pipefail
 # - CSV report (default: synopsys_sast_audit.csv)
 #
 # Usage:
-# ./tools/synopsys_sast_audit_v1.sh # current repo
-# ./tools/synopsys_sast_audit_v1.sh . out.csv # custom CSV
-# ./tools/synopsys_sast_audit_v1.sh /repos out.csv # all git repos in folder
+# ./synopsys_sast_audit_v1.sh # current repo
+# ./synopsys_sast_audit_v1.sh . out.csv # custom CSV
+# ./synopsys_sast_audit_v1.sh /repos out.csv # all git repos in folder
 #
 # Notes:
 # - Pipeline-safe: grep "no match" will not fail
