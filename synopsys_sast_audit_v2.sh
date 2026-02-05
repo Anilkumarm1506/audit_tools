@@ -12,8 +12,9 @@ set -euo pipefail
 # - When called multiple times with the same OUT_CSV, it APPENDS rows
 # - CSV header is written ONLY ONCE if the file is missing/empty
 #
-# Build detection:
+# Build detection (UPDATED for monorepos):
 # - Uses git ls-files (tracked + untracked non-ignored) for speed
+# - Collects MULTIPLE package manager file PATHS across subfolders (bounded)
 # - Adds targeted filesystem fallback to detect marker files even if gitignored
 # ============================================================
 
@@ -22,9 +23,6 @@ OUT_CSV="${2:-synopsys_sast_audit.csv}"
 
 shopt -s globstar nullglob
 
-# ------------------------------------------------------------
-# Pipeline file globs (common CI systems)
-# ------------------------------------------------------------
 PIPELINE_GLOBS=(
   "azure-pipelines.yml" "azure-pipelines.yaml"
   ".github/workflows/*.yml" ".github/workflows/*.yaml"
@@ -34,9 +32,6 @@ PIPELINE_GLOBS=(
   "**/bamboo-specs.yml" "**/bamboo-specs.yaml"
 )
 
-# ------------------------------------------------------------
-# Wrapper/script/build globs (where scan logic is often hidden)
-# ------------------------------------------------------------
 WRAPPER_GLOBS=(
   "ci/**/*"
   "scripts/**/*"
@@ -61,41 +56,30 @@ WRAPPER_GLOBS=(
   "**/package.json"
 )
 
-# ------------------------------------------------------------
-# SAST "direct evidence" markers (Polaris/Coverity/Bridge/Actions/ADO tasks)
-# UPDATED: Added Jenkins Coverity plugin pipeline steps.
-# ------------------------------------------------------------
+# DIRECT markers (already includes bridge/action/ado/coverity/polaris + jenkins plugin markers)
 DIRECT_SAST_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|--stage[[:space:]]+polaris|--input[[:space:]]+bridge\.ya?ml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|polaris\.yml|polaris\.yaml|withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
 
-# ------------------------------------------------------------
-# "Indirect integration" markers (templates/reuse/shared libs/containers)
-# ------------------------------------------------------------
 INDIRECT_TEMPLATE_PATTERN='- template:|extends:|resources:|@templates|include:|uses:[[:space:]]*[^[:space:]]+\/[^[:space:]]+@|workflow_call|reusable workflow'
 INDIRECT_JENKINS_LIB_PATTERN='@Library\(|library\(|sharedLibrary|vars\/|def[[:space:]]+securityScan|securityScan\(|sastScan\(|polarisScan\(|coverityScan\('
 INDIRECT_CONTAINER_PATTERN='docker[[:space:]]+run|container:|image:|services:|podman[[:space:]]+run'
 
-# ------------------------------------------------------------
-# Extra keywords used only to qualify indirect hits
-# ------------------------------------------------------------
 SAST_KEYWORDS_PATTERN='polaris|coverity|synopsys|bridge|sast'
 
-# ------------------------------------------------------------
-# CSV header (write once; allow append for multi-branch runs)
-# ------------------------------------------------------------
+# Write CSV header once
 if [[ ! -s "$OUT_CSV" ]]; then
   echo "repo,branch,build_type,package_manager_file,artifact_type,file_path,ci_type,found_type,invocation_style,script_lines" > "$OUT_CSV"
 fi
 
-# --- Safe grep wrappers ---
+# Safe grep wrappers
 grep_q() { grep -Eq "$1" -- "$2" 2>/dev/null; }
 grep_in() { grep -Ein "$1" -- "$2" 2>/dev/null || true; }
 
-# --- CSV sanitize ---
+# CSV sanitize
 csv_escape() {
   echo "$1" | sed -E 's/"/""/g' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//'
 }
 
-# --- Identify CI type from file path ---
+# CI type
 ci_type_of() {
   local f="$1"
   if [[ "$f" == *".github/workflows/"* ]]; then echo "github_actions"
@@ -107,8 +91,7 @@ ci_type_of() {
   fi
 }
 
-# --- Classify invocation style (best-effort) ---
-# UPDATED: detect Jenkins Coverity plugin steps explicitly.
+# Invocation style
 sast_invocation_style() {
   local f="$1"
   if grep_q 'synopsys-sig/synopsys-action' "$f"; then
@@ -128,7 +111,7 @@ sast_invocation_style() {
   fi
 }
 
-# --- Evidence lines for report (pipeline-safe) ---
+# Evidence lines
 script_lines() {
   local f="$1"
   local n=8
@@ -142,7 +125,7 @@ script_lines() {
   )
 }
 
-# --- Determine found_type (SAST-only) ---
+# found_type
 classify_found_type() {
   local f="$1"
 
@@ -163,7 +146,7 @@ classify_found_type() {
   echo "none"
 }
 
-# --- Normalize GitHub URL (ssh -> https) best effort ---
+# Normalize GitHub URL (ssh -> https)
 normalize_repo_url() {
   local url="${1:-}"
   if [[ "$url" =~ ^git@github\.com:(.+)\.git$ ]]; then
@@ -211,10 +194,7 @@ branch_of() {
   [[ -n "$b" && "$b" != "undefined" ]] && echo "$b" || echo "unknown"
 }
 
-# ------------------------------------------------------------
-# Repo file index:
-# - tracked + untracked (excluding ignored) for speed & sanity
-# ------------------------------------------------------------
+# Repo file index
 repo_file_index() {
   local repo="$1"
   if git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -224,11 +204,7 @@ repo_file_index() {
   fi
 }
 
-# ------------------------------------------------------------
-# Targeted fallback search for marker files even if gitignored.
-# Avoids heavy directories and .git.
-# Returns first match relative path or empty.
-# ------------------------------------------------------------
+# Targeted fallback search for marker files even if gitignored (kept)
 find_first_marker_path() {
   local repo="$1"
   shift
@@ -246,29 +222,42 @@ find_first_marker_path() {
       -print 2>/dev/null | head -n 1 | sed 's|^\./||' ) || true
 }
 
-# Basename match from git-index; if missing, try filesystem fallback
-first_match_basename_with_fallback() {
+# ----------- UPDATED: collect multiple paths per build type (monorepo-aware) -----------
+# Limit how many paths we record per type (avoid huge CSV)
+MAX_PM_PATHS_PER_TYPE="${MAX_PM_PATHS_PER_TYPE:-10}"
+
+# Collect up to MAX_PM_PATHS_PER_TYPE paths from git-index by regex; fallback to filesystem by file names if none found
+collect_paths_with_fallback() {
   local repo="$1"
   local files="$2"
   local regex="$3"
   shift 3
   local -a fallback_names=("$@")
 
-  local b=""
-  b="$(echo "$files" | grep -Ei "$regex" | head -n 1 | awk -F/ '{print $NF}')"
-  if [[ -n "$b" ]]; then
-    echo "$b"
-    return
+  local out=""
+  # From git-index (relative paths)
+  out="$(echo "$files" | grep -Ei "$regex" | head -n "$MAX_PM_PATHS_PER_TYPE" || true)"
+
+  # If none, fallback to filesystem (gitignored)
+  if [[ -z "$out" && ${#fallback_names[@]} -gt 0 ]]; then
+    out="$(cd "$repo" && \
+      find . -type f \
+        -not -path './.git/*' \
+        -not -path '*/.git/*' \
+        -not -path '*/node_modules/*' \
+        -not -path '*/.gradle/*' \
+        -not -path '*/target/*' \
+        -not -path '*/build/*' \
+        \( $(printf -- '-name %q -o ' "${fallback_names[@]}" | sed 's/ -o $//') \) \
+        -print 2>/dev/null | sed 's|^\./||' | head -n "$MAX_PM_PATHS_PER_TYPE" )" || true
   fi
 
-  local p=""
-  p="$(find_first_marker_path "$repo" "${fallback_names[@]}")"
-  if [[ -n "$p" ]]; then
-    echo "$(basename "$p")"
-    return
+  # Join lines into "; "
+  if [[ -n "$out" ]]; then
+    echo "$out" | paste -sd ';' - | sed 's/;/; /g'
+  else
+    echo ""
   fi
-
-  echo ""
 }
 
 # Helpers for multi-build detection
@@ -280,11 +269,7 @@ add_once() {
   arr+=("$val")
 }
 
-# ------------------------------------------------------------
-# Multi-build detection returning:
-# build_type|package_manager_file
-# Both may be '+' joined and aligned
-# ------------------------------------------------------------
+# UPDATED build detection: returns build_type + all relevant package manager file PATHS
 build_info_of_repo() {
   local repo="$1"
   local files
@@ -292,76 +277,74 @@ build_info_of_repo() {
   [[ -n "$files" ]] || { echo "unknown|unknown"; return; }
 
   local types=()
-  local pm_files=()
+  local pm_paths=() # aligned with types
 
   # Maven
-  if echo "$files" | grep -Eqi '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "pom.xml" "mvnw" "mvnw.cmd")" ]]; then
+  local maven_paths
+  maven_paths="$(collect_paths_with_fallback "$repo" "$files" '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$' "pom.xml" "mvnw" "mvnw.cmd")"
+  if [[ -n "$maven_paths" ]]; then
     add_once "maven" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pom\.xml$' "pom.xml")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(mvnw|mvnw\.cmd)$' "mvnw" "mvnw.cmd")"
-    [[ -z "$f" ]] && f="pom.xml"
-    pm_files+=("$f")
+    pm_paths+=("$maven_paths")
   fi
 
   # Gradle
-  if echo "$files" | grep -Eqi '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "build.gradle" "build.gradle.kts" "settings.gradle" "settings.gradle.kts" "gradle.properties" "gradlew" "gradlew.bat")" ]]; then
+  local gradle_paths
+  gradle_paths="$(collect_paths_with_fallback "$repo" "$files" '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$' \
+    "build.gradle" "build.gradle.kts" "settings.gradle" "settings.gradle.kts" "gradle.properties" "gradlew" "gradlew.bat")"
+  if [[ -n "$gradle_paths" ]]; then
     add_once "gradle" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(build\.gradle\.kts|build\.gradle)$' "build.gradle.kts" "build.gradle")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(settings\.gradle\.kts|settings\.gradle)$' "settings.gradle.kts" "settings.gradle")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(gradlew|gradlew\.bat)$' "gradlew" "gradlew.bat")"
-    [[ -z "$f" ]] && f="build.gradle"
-    pm_files+=("$f")
+    pm_paths+=("$gradle_paths")
   fi
 
-  # npm ecosystem
-  if echo "$files" | grep -Eqi '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "package.json" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "pnpm-lock.yml" "pnpm-workspace.yaml" "pnpm-workspace.yml")" ]]; then
+  # npm / node
+  local npm_paths
+  npm_paths="$(collect_paths_with_fallback "$repo" "$files" '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$' \
+    "package.json" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "pnpm-lock.yml" "pnpm-workspace.yaml" "pnpm-workspace.yml")"
+  if [[ -n "$npm_paths" ]]; then
     add_once "npm" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)package\.json$' "package.json")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(pnpm-lock\.ya?ml|yarn\.lock|package-lock\.json)$' "pnpm-lock.yaml" "pnpm-lock.yml" "yarn.lock" "package-lock.json")"
-    [[ -z "$f" ]] && f="package.json"
-    pm_files+=("$f")
+    pm_paths+=("$npm_paths")
   fi
 
   # Docker
-  if echo "$files" | grep -Eqi '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Dockerfile" "docker-compose.yml" "docker-compose.yaml")" ]]; then
+  local docker_paths
+  docker_paths="$(collect_paths_with_fallback "$repo" "$files" '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$' "Dockerfile" "docker-compose.yml" "docker-compose.yaml")"
+  if [[ -n "$docker_paths" ]]; then
     add_once "docker" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Dockerfile$' "Dockerfile")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)docker-compose\.ya?ml$' "docker-compose.yml" "docker-compose.yaml")"
-    [[ -z "$f" ]] && f="Dockerfile"
-    pm_files+=("$f")
+    pm_paths+=("$docker_paths")
   fi
 
-  # Nothing detected
+  # If nothing found
   if [[ ${#types[@]} -eq 0 ]]; then
     echo "unknown|unknown"
     return
   fi
 
-  # Join with '+'
-  local build_out="" file_out=""
+  # Join build types with '+'
+  local build_out=""
   local i
   for i in "${!types[@]}"; do
     if [[ -z "$build_out" ]]; then
       build_out="${types[$i]}"
-      file_out="${pm_files[$i]:-unknown}"
     else
       build_out="${build_out}+${types[$i]}"
-      file_out="${file_out}+${pm_files[$i]:-unknown}"
     fi
   done
 
-  echo "${build_out}|${file_out}"
-}
+  # Join package manager paths across types with " | " to keep it readable
+  # Example: "frontend/package.json; backend/package.json | backend/pom.xml | mobile/android/build.gradle"
+  local pm_out=""
+  for i in "${!pm_paths[@]}"; do
+    if [[ -z "$pm_out" ]]; then
+      pm_out="${pm_paths[$i]}"
+    else
+      pm_out="${pm_out} | ${pm_paths[$i]}"
+    fi
+  done
 
-# --- Scan file list and append to CSV ---
+  echo "${build_out}|${pm_out}"
+}
+# ----------- END UPDATED BUILD DETECTION -----------
+
 scan_files_and_report() {
   local repo="$1"
   local repo_url="$2"
@@ -376,7 +359,7 @@ scan_files_and_report() {
     [[ -f "$abs" ]] || continue
     local rel="${abs#$repo/}"
 
-    # Skip scanning the audit tool itself (prevents self-match)
+    # Skip scanning audit tooling itself
     [[ "$rel" == *"synopsys_sast_audit"*".sh"* ]] && continue
     [[ "$rel" == *"bd_detect_audit"*".sh"* ]] && continue
 
@@ -471,3 +454,5 @@ echo "Done. CSV: $OUT_CSV"
 echo "Interpretation:"
 echo " - found_type=direct => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
 echo " - found_type=indirect => likely via templates/shared libs/container; audit the referenced source"
+echo "Build detection note:"
+echo " - package_manager_file now lists multiple PATHS across subfolders (monorepo-aware, capped at ${MAX_PM_PATHS_PER_TYPE:-10} per type)"
