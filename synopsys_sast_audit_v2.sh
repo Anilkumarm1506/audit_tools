@@ -63,8 +63,9 @@ WRAPPER_GLOBS=(
 
 # ------------------------------------------------------------
 # SAST "direct evidence" markers (Polaris/Coverity/Bridge/Actions/ADO tasks)
+# UPDATED: Added Jenkins Coverity plugin pipeline steps.
 # ------------------------------------------------------------
-DIRECT_SAST_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|polaris\.yml|polaris\.yaml'
+DIRECT_SAST_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|--stage[[:space:]]+polaris|--input[[:space:]]+bridge\.ya?ml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|polaris\.yml|polaris\.yaml|withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
 
 # ------------------------------------------------------------
 # "Indirect integration" markers (templates/reuse/shared libs/containers)
@@ -107,15 +108,18 @@ ci_type_of() {
 }
 
 # --- Classify invocation style (best-effort) ---
+# UPDATED: detect Jenkins Coverity plugin steps explicitly.
 sast_invocation_style() {
   local f="$1"
   if grep_q 'synopsys-sig/synopsys-action' "$f"; then
     echo "github_action_synopsys_action"
+  elif grep_q 'withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects' "$f"; then
+    echo "jenkins_coverity_plugin_steps"
   elif grep_q 'SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris' "$f"; then
     echo "ado_task_extension"
-  elif grep_q 'synopsys[- ]?bridge|(^|[[:space:]])bridge([[:space:]]|$)' "$f"; then
+  elif grep_q 'synopsys[- ]?bridge|(^|[[:space:]/])bridge([[:space:]]|$)|--stage[[:space:]]+polaris|--input[[:space:]]+bridge\.ya?ml' "$f"; then
     echo "bridge_cli"
-  elif grep_q 'cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-commit-defects' "$f"; then
+  elif grep_q 'cov-build|cov-analyze|cov-capture|cov-commit-defects' "$f"; then
     echo "coverity_cli"
   elif grep_q 'polaris' "$f"; then
     echo "polaris_cli_or_config"
@@ -313,7 +317,7 @@ build_info_of_repo() {
     pm_files+=("$f")
   fi
 
-  # npm ecosystem  ✅ (this fixes your cli branch case)
+  # npm ecosystem
   if echo "$files" | grep -Eqi '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$' \
      || [[ -n "$(find_first_marker_path "$repo" "package.json" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "pnpm-lock.yml" "pnpm-workspace.yaml" "pnpm-workspace.yml")" ]]; then
     add_once "npm" types
@@ -324,7 +328,7 @@ build_info_of_repo() {
     pm_files+=("$f")
   fi
 
-  # Docker ✅
+  # Docker
   if echo "$files" | grep -Eqi '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$' \
      || [[ -n "$(find_first_marker_path "$repo" "Dockerfile" "docker-compose.yml" "docker-compose.yaml")" ]]; then
     add_once "docker" types
@@ -332,132 +336,6 @@ build_info_of_repo() {
     f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Dockerfile$' "Dockerfile")"
     [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)docker-compose\.ya?ml$' "docker-compose.yml" "docker-compose.yaml")"
     [[ -z "$f" ]] && f="Dockerfile"
-    pm_files+=("$f")
-  fi
-
-  # .NET
-  if echo "$files" | grep -Eqi '(\.sln|\.csproj|\.fsproj|\.vbproj)$|(^|/)(global\.json|Directory\.Build\.props|Directory\.Build\.targets|nuget\.config|packages\.config)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "global.json" "Directory.Build.props" "Directory.Build.targets" "nuget.config" "packages.config")" ]]; then
-    add_once "dotnet" types
-    local f
-    f="$(echo "$files" | grep -Ei '(\.sln)$' | head -n 1 | awk -F/ '{print $NF}' || true)"
-    [[ -z "$f" ]] && f="$(echo "$files" | grep -Ei '(\.(csproj|fsproj|vbproj))$' | head -n 1 | awk -F/ '{print $NF}' || true)"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)global\.json$' "global.json")"
-    [[ -z "$f" ]] && f="*.csproj"
-    pm_files+=("$f")
-  fi
-
-  # Python
-  if echo "$files" | grep -Eqi '(^|/)(pyproject\.toml|poetry\.lock|Pipfile|Pipfile\.lock|setup\.py|setup\.cfg|requirements(\-[a-z0-9_-]+)?\.txt|requirements\.in|tox\.ini|environment\.ya?ml|conda\.ya?ml)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "pyproject.toml" "poetry.lock" "Pipfile" "Pipfile.lock" "setup.py" "setup.cfg" "requirements.txt" "requirements.in" "tox.ini" "environment.yml" "environment.yaml" "conda.yml" "conda.yaml")" ]]; then
-    add_once "python" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pyproject\.toml$' "pyproject.toml")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(poetry\.lock|Pipfile\.lock|Pipfile)$' "poetry.lock" "Pipfile.lock" "Pipfile")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)requirements(\-[a-z0-9_-]+)?\.txt$' "requirements.txt")"
-    [[ -z "$f" ]] && f="pyproject.toml"
-    pm_files+=("$f")
-  fi
-
-  # Go
-  if echo "$files" | grep -Eqi '(^|/)(go\.mod|go\.sum|go\.work|go\.work\.sum)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "go.mod" "go.sum" "go.work" "go.work.sum")" ]]; then
-    add_once "go" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)go\.mod$' "go.mod")"
-    [[ -z "$f" ]] && f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)go\.work$' "go.work")"
-    [[ -z "$f" ]] && f="go.mod"
-    pm_files+=("$f")
-  fi
-
-  # Rust
-  if echo "$files" | grep -Eqi '(^|/)(Cargo\.toml|Cargo\.lock)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Cargo.toml" "Cargo.lock")" ]]; then
-    add_once "rust" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Cargo\.toml$' "Cargo.toml")"
-    [[ -z "$f" ]] && f="Cargo.toml"
-    pm_files+=("$f")
-  fi
-
-  # PHP
-  if echo "$files" | grep -Eqi '(^|/)(composer\.json|composer\.lock)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "composer.json" "composer.lock")" ]]; then
-    add_once "php" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)composer\.json$' "composer.json")"
-    [[ -z "$f" ]] && f="composer.json"
-    pm_files+=("$f")
-  fi
-
-  # Ruby
-  if echo "$files" | grep -Eqi '(^|/)(Gemfile|Gemfile\.lock|Rakefile|\.ruby-version)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Gemfile" "Gemfile.lock" "Rakefile" ".ruby-version")" ]]; then
-    add_once "ruby" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)Gemfile$' "Gemfile")"
-    [[ -z "$f" ]] && f="Gemfile"
-    pm_files+=("$f")
-  fi
-
-  # Dart
-  if echo "$files" | grep -Eqi '(^|/)(pubspec\.ya?ml|pubspec\.lock)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "pubspec.yaml" "pubspec.yml" "pubspec.lock")" ]]; then
-    add_once "dart" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)pubspec\.ya?ml$' "pubspec.yaml" "pubspec.yml")"
-    [[ -z "$f" ]] && f="pubspec.yaml"
-    pm_files+=("$f")
-  fi
-
-  # SwiftPM
-  if echo "$files" | grep -Eqi '(^|/)Package\.swift$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Package.swift")" ]]; then
-    add_once "swift" types
-    pm_files+=("Package.swift")
-  fi
-
-  # iOS markers
-  if echo "$files" | grep -Eqi '(\.xcodeproj/|\.xcworkspace/)|(^|/)(Podfile|Podfile\.lock|Cartfile|Cartfile\.resolved)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Podfile" "Podfile.lock" "Cartfile" "Cartfile.resolved")" ]]; then
-    add_once "ios" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(Podfile|Cartfile)$' "Podfile" "Cartfile")"
-    [[ -z "$f" ]] && f="Podfile"
-    pm_files+=("$f")
-  fi
-
-  # Android marker
-  if echo "$files" | grep -Eqi '(^|/)AndroidManifest\.xml$' \
-     || [[ -n "$(find_first_marker_path "$repo" "AndroidManifest.xml")" ]]; then
-    add_once "android" types
-    pm_files+=("AndroidManifest.xml")
-  fi
-
-  # Bazel marker
-  if echo "$files" | grep -Eqi '(^|/)(WORKSPACE|WORKSPACE\.bazel|MODULE\.bazel|BUILD|BUILD\.bazel|\.bazelrc|bazel\.rc)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "WORKSPACE" "WORKSPACE.bazel" "MODULE.bazel" "BUILD" "BUILD.bazel" ".bazelrc" "bazel.rc")" ]]; then
-    add_once "bazel" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(MODULE\.bazel|WORKSPACE\.bazel|WORKSPACE)$' "MODULE.bazel" "WORKSPACE.bazel" "WORKSPACE")"
-    [[ -z "$f" ]] && f="WORKSPACE"
-    pm_files+=("$f")
-  fi
-
-  # CMake
-  if echo "$files" | grep -Eqi '(^|/)CMakeLists\.txt$' \
-     || [[ -n "$(find_first_marker_path "$repo" "CMakeLists.txt")" ]]; then
-    add_once "cmake" types
-    pm_files+=("CMakeLists.txt")
-  fi
-
-  # Make
-  if echo "$files" | grep -Eqi '(^|/)(Makefile|makefile|GNUmakefile)$' \
-     || [[ -n "$(find_first_marker_path "$repo" "Makefile" "makefile" "GNUmakefile")" ]]; then
-    add_once "make" types
-    local f
-    f="$(first_match_basename_with_fallback "$repo" "$files" '(^|/)(Makefile|makefile|GNUmakefile)$' "Makefile" "makefile" "GNUmakefile")"
-    [[ -z "$f" ]] && f="Makefile"
     pm_files+=("$f")
   fi
 
@@ -591,5 +469,5 @@ fi
 echo
 echo "Done. CSV: $OUT_CSV"
 echo "Interpretation:"
-echo " - found_type=direct   => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
+echo " - found_type=direct => Synopsys SAST integration visible (Polaris/Coverity/Bridge/task/action)"
 echo " - found_type=indirect => likely via templates/shared libs/container; audit the referenced source"
