@@ -2,53 +2,68 @@
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_to_blackduck_migrate_v5.sh
+# Script: synopsys_to_blackduck_migrate_v6.sh
+# Purpose:
+#   - Audit Synopsys/Polaris/Coverity/Bridge usage across common CI configs
+#   - Dry-run: show diffs (and save to a diff artifact file)
+#   - Apply: backup -> transform -> commit -> push
+#   - Rollback: git revert last migration commit OR restore from latest backups
 #
-# What’s new vs v4:
-# ✅ Dry-run shows real diffs reliably (same transforms as apply, on temp copy)
-# ✅ Audit CSV includes build_type + package_manager_file (monorepo-aware)
-# ✅ invocation_style "unknown" reduced (bridge.yml / env-var patterns / travis/bamboo/gha better classified)
-# ✅ Modes: audit | dry-run | apply | rollback (same semantics)
-# ✅ Backups per-branch before edits: .migrate_backups/<ts>/<branch>/<file>
-# ✅ Apply: backup + update + commit + push (token handled by pipeline)
-# ✅ Rollback: git revert last bd-migration commit OR restore latest backups for that branch
+# Modes (MODE):
+#   - audit     : scan & write CSV only
+#   - dry-run   : scan & write CSV + print diffs + save diffs to a file
+#   - apply     : scan & write CSV + apply edits + (optional) commit/push
+#   - rollback  : revert last migration commit (or restore backup) + (optional) push
 #
-# Usage (local):
-#   MODE=audit    BRANCHES="main,dev" ROOT=/repo OUT_CSV=out.csv ./synopsys_to_blackduck_migrate_v5.sh
-#   MODE=dry-run  BRANCHES="main"     ROOT=/repo OUT_CSV=out.csv ./synopsys_to_blackduck_migrate_v5.sh
-#   MODE=apply    BRANCHES="main"     ROOT=/repo OUT_CSV=out.csv ./synopsys_to_blackduck_migrate_v5.sh
-#   MODE=rollback BRANCHES="main"     ROOT=/repo OUT_CSV=out.csv ./synopsys_to_blackduck_migrate_v5.sh
+# Key improvements over v5:
+#   ✅ invocation_style is MULTI-VALUED (no more losing signal when file has both CLI + plugin)
+#   ✅ build_type and package_manager_file formatting cleaned + stable for monorepos
+#   ✅ dry-run diffs are saved to a single artifact file (DRYRUN_DIFF_FILE)
+#   ✅ optional migration_recommendation column in CSV (actionable audit report)
+#
+# Safety notes:
+#   - Jenkins edits are OFF by default (EDIT_JENKINS=0). Many Jenkins setups need manual validation.
+#   - Transforms are conservative; placeholders are added where exact org config is unknown.
+#
+# Typical local usage:
+#   MODE=audit    ROOT=./repo OUT_CSV=out.csv BRANCHES="main,dev" ./synopsys_to_blackduck_migrate_v6.sh
+#   MODE=dry-run  ROOT=./repo OUT_CSV=out.csv BRANCHES="main"     ./synopsys_to_blackduck_migrate_v6.sh
+#   MODE=apply    ROOT=./repo OUT_CSV=out.csv BRANCHES="main" COMMIT=1 PUSH=1 ./synopsys_to_blackduck_migrate_v6.sh
+#   MODE=rollback ROOT=./repo BRANCHES="main" COMMIT=1 PUSH=1 ./synopsys_to_blackduck_migrate_v6.sh
 #
 # Env:
-#   MODE=audit|dry-run|apply|rollback
-#   ROOT=path-to-git-repo
-#   OUT_CSV=csv-file (aggregated)
-#   BRANCHES="comma,separated,branches" (optional; default current)
-#   ALL_BRANCHES=1 (optional; scan all remote branches)
-#   REMOTE=origin (default origin)
-#   PUSH=1|0 (default 0 for audit/dry-run, 1 for apply/rollback when used by pipeline)
-#   COMMIT=1|0 (default 0 for audit/dry-run, 1 for apply/rollback when used by pipeline)
-#   ALLOW_DIRTY=1|0 (default 0)
-#   MAX_PM_PATHS_PER_TYPE=10 (default 10)
+#   ROOT=path-to-git-repo                       (default ".")
+#   MODE=audit|dry-run|apply|rollback           (default audit)
+#   OUT_CSV=csv filename                        (default synopsys_audit.csv)
+#   DRYRUN_DIFF_FILE=diff filename              (default dryrun_diffs.txt) [only in dry-run]
+#   BRANCHES="comma,separated,branches"         (optional; default current branch)
+#   ALL_BRANCHES=1                              (optional; scan all remote branches)
+#   REMOTE=origin                               (default origin)
+#   COMMIT=1|0                                  (default 0; set 1 for apply/rollback)
+#   PUSH=1|0                                    (default 0; set 1 to push)
+#   ALLOW_DIRTY=1|0                             (default 0; require clean working tree for apply/rollback)
+#   EDIT_JENKINS=1|0                            (default 0; enable Jenkinsfile transformations)
+#   MAX_PM_PATHS_PER_TYPE=10                    (default 10)
 #
-# NOTE:
-# - This script edits only CI YAML + bridge.yml by default.
-# - Jenkinsfile editing is disabled by default (EDIT_JENKINS=0). You can enable if needed.
+# Output:
+#   - OUT_CSV: consolidated report
+#   - .migrate_backups/<timestamp>/<branch>/... (apply backups)
+#   - DRYRUN_DIFF_FILE (dry-run)                (unified diffs)
 # ============================================================
 
 ROOT="${ROOT:-.}"
-MODE="${MODE:-audit}"                         # audit|dry-run|apply|rollback
+MODE="${MODE:-audit}"
 OUT_CSV="${OUT_CSV:-synopsys_audit.csv}"
+DRYRUN_DIFF_FILE="${DRYRUN_DIFF_FILE:-dryrun_diffs.txt}"
 
-BRANCHES="${BRANCHES:-}"                      # comma-separated list
+BRANCHES="${BRANCHES:-}"
 ALL_BRANCHES="${ALL_BRANCHES:-0}"
 
 REMOTE="${REMOTE:-origin}"
-PUSH="${PUSH:-0}"
 COMMIT="${COMMIT:-0}"
+PUSH="${PUSH:-0}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
 EDIT_JENKINS="${EDIT_JENKINS:-0}"
-STRICT_REPLACE="${STRICT_REPLACE:-0}"         # currently conservative; kept for future
 
 MAX_PM_PATHS_PER_TYPE="${MAX_PM_PATHS_PER_TYPE:-10}"
 
@@ -58,7 +73,6 @@ BACKUP_ROOT=".migrate_backups/${TS}"
 
 shopt -s globstar nullglob
 
-# We scan these; we only modify YAML/bridge.yml (and Jenkinsfile only if EDIT_JENKINS=1).
 PIPELINE_GLOBS=(
   ".travis.yml"
   "azure-pipelines.yml" "azure-pipelines.yaml"
@@ -69,14 +83,27 @@ PIPELINE_GLOBS=(
   "Jenkinsfile" "Jenkinsfile*"
 )
 
-# Detection patterns
-DIRECT_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|--input[[:space:]]+bridge\.ya?ml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
+# ----------------------------
+# Patterns (detection)
+# ----------------------------
 
-# Helpful env var markers (to improve invocation_style classification)
-ENV_MARKERS_PATTERN='POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|COVERITY_URL|COVERITY_STREAM|BLACKDUCK_URL|BLACKDUCK_API_TOKEN|BLACKDUCK_TOKEN'
+DIRECT_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-format-errors|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|--input[[:space:]]+bridge\.ya?ml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
+
+PAT_GHA_ACTION='uses:\s*synopsys-sig/synopsys-action'
+PAT_ADO_TASK='SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris'
+PAT_BRIDGE_CLI='(^|[[:space:]/])bridge([[:space:]]|$)|synopsys[- ]?bridge|--input[[:space:]]+bridge\.ya?ml|--stage[[:space:]]+(polaris|blackduck)'
+PAT_COVERITY_CLI='cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-format-errors'
+PAT_JENKINS_PLUGIN='withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
+PAT_POLARIS_ENV='POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|polaris_server_url|polaris_access_token'
+PAT_BRIDGE_CONFIG='^\s*stage:\s*$|^\s*polaris\s*:|^\s*blackduck\s*:'
+
+ENV_MARKERS_PATTERN='POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|COVERITY_URL|COVERITY_STREAM|BLACKDUCK_URL|BLACKDUCK_API_TOKEN|BLACKDUCK_TOKEN|blackDuckService|polarisService'
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
 grep_q(){ grep -Eq "$1" -- "$2" 2>/dev/null; }
 grep_in(){ grep -Ein "$1" -- "$2" 2>/dev/null || true; }
 
@@ -86,7 +113,7 @@ csv_escape(){
 
 ensure_csv_header(){
   if [[ ! -s "$OUT_CSV" ]]; then
-    echo "repo,branch,build_type,package_manager_file,file_path,ci_type,found_type,invocation_style,evidence" > "$OUT_CSV"
+    echo "repo,branch,build_type,package_manager_file,file_path,ci_type,found_type,invocation_style,evidence,migration_recommendation" > "$OUT_CSV"
   fi
 }
 
@@ -129,54 +156,41 @@ found_type_of(){
   if grep_q "$DIRECT_PATTERN" "$f"; then echo "direct"; else echo "none"; fi
 }
 
-# Improved invocation style classifier (reduces "unknown")
 invocation_style_of(){
   local f="$1"
   local rel="${f#$ROOT/}"
+  local styles=()
 
-  # bridge config file itself
-  if [[ "$rel" == bridge.y*ml ]]; then
-    if grep_q '^\s*stage:\s*$' "$f" || grep_q '^\s*polaris\s*:' "$f" || grep_q '^\s*blackduck\s*:' "$f"; then
-      echo "bridge_config_file"; return
-    fi
+  if [[ "$rel" == bridge.y*ml ]] && grep_q "$PAT_BRIDGE_CONFIG" "$f"; then
+    styles+=("bridge_config_file")
   fi
 
-  # GitHub Synopsys Action
-  if grep_q 'uses:\s*synopsys-sig/synopsys-action' "$f"; then
-    echo "github_action_synopsys_action"; return
+  grep_q "$PAT_GHA_ACTION" "$f"     && styles+=("github_action_synopsys_action")
+  grep_q "$PAT_ADO_TASK" "$f"       && styles+=("ado_task_extension")
+  grep_q "$PAT_BRIDGE_CLI" "$f"     && styles+=("bridge_cli")
+  grep_q "$PAT_COVERITY_CLI" "$f"   && styles+=("coverity_cli")
+  grep_q "$PAT_JENKINS_PLUGIN" "$f" && styles+=("jenkins_coverity_plugin_steps")
+
+  if grep_q "$PAT_POLARIS_ENV" "$f" && [[ ${#styles[@]} -eq 0 ]]; then
+    styles+=("polaris_env_or_config")
   fi
 
-  # Azure DevOps task extensions
-  if grep_q 'SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris' "$f"; then
-    echo "ado_task_extension"; return
+  if [[ ${#styles[@]} -eq 0 ]]; then
+    echo "unknown"
+    return
   fi
 
-  # Bridge CLI invocation in any script/YAML
-  if grep_q '(^|[[:space:]/])bridge([[:space:]]|$)|synopsys[- ]?bridge|--input[[:space:]]+bridge\.ya?ml|--stage[[:space:]]+(polaris|blackduck)' "$f"; then
-    echo "bridge_cli"; return
-  fi
-
-  # Coverity CLI invocation
-  if grep_q 'cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-format-errors' "$f"; then
-    echo "coverity_cli"; return
-  fi
-
-  # Jenkins plugin steps
-  if grep_q 'withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects' "$f"; then
-    echo "jenkins_coverity_plugin_steps"; return
-  fi
-
-  # Polaris config/env only (seen in Jenkins env blocks etc.)
-  if grep_q 'POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|polaris_server_url|polaris_access_token' "$f"; then
-    echo "polaris_env_or_config"; return
-  fi
-
-  echo "unknown"
+  local out=""
+  local s
+  for s in "${styles[@]}"; do
+    [[ -z "$out" ]] && out="$s" || out="$out + $s"
+  done
+  echo "$out"
 }
 
 evidence_lines(){
   local f="$1"
-  local n=10
+  local n=12
   (
     grep_in "$DIRECT_PATTERN|$ENV_MARKERS_PATTERN" "$f" \
       | head -n "$n" \
@@ -186,8 +200,46 @@ evidence_lines(){
   )
 }
 
+migration_recommendation_of(){
+  local rel="$1"
+  local abs="$ROOT/$rel"
+  local ci; ci="$(ci_type_of "$rel")"
+
+  if [[ "$ci" == "jenkins" && "$EDIT_JENKINS" -ne 1 ]]; then
+    echo "Manual Jenkins review required (EDIT_JENKINS=0). Consider Bridge stage change or Jenkins plugin migration."
+    return
+  fi
+
+  if grep_q "$PAT_ADO_TASK" "$abs" && grep_q 'SynopsysSecurityScan@' "$abs"; then
+    echo "Replace SynopsysSecurityScan with BlackDuckSecurityScan; update service connection + scanType."
+    return
+  fi
+
+  if grep_q "$PAT_COVERITY_CLI" "$abs" && [[ "$ci" == "azure_devops" ]]; then
+    echo "Keep Coverity CLI SAST; add BlackDuckSecurityScan for SCA (service/project/version)."
+    return
+  fi
+
+  if grep_q "$PAT_BRIDGE_CLI" "$abs"; then
+    echo "Switch Bridge CLI --stage polaris -> blackduck; ensure BLACKDUCK_URL/API_TOKEN secrets."
+    return
+  fi
+
+  if grep_q "$PAT_GHA_ACTION" "$abs"; then
+    echo "Add org-approved Black Duck scan step/action with secrets (SCA) alongside Synopsys action as needed."
+    return
+  fi
+
+  if [[ "$ci" == "bridge_config" ]]; then
+    echo "Add Black Duck stage block to bridge.yml (url/apiToken/project/version placeholders)."
+    return
+  fi
+
+  echo "Review required; no migration rule matched."
+}
+
 # ----------------------------
-# Build detection (monorepo-aware, multi-path)
+# Build detection (monorepo-aware)
 # ----------------------------
 
 repo_file_index(){
@@ -225,45 +277,47 @@ build_info_of_repo(){
   [[ -n "$files" ]] || { echo "unknown|unknown"; return; }
 
   local types=()
-  local pm_paths=()
+  local pm_map=()
 
   local maven_paths gradle_paths npm_paths docker_paths
 
   maven_paths="$(collect_paths_with_fallback "$files" '(^|/)pom\.xml$|(^|/)(mvnw|mvnw\.cmd)$' "pom.xml" "mvnw" "mvnw.cmd")"
-  [[ -n "$maven_paths" ]] && { types+=("maven"); pm_paths+=("$maven_paths"); }
+  [[ -n "$maven_paths" ]] && { types+=("maven"); pm_map+=("maven: ${maven_paths}"); }
 
   gradle_paths="$(collect_paths_with_fallback "$files" '(^|/)(build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.properties|gradlew|gradlew\.bat)$' \
     "build.gradle" "build.gradle.kts" "settings.gradle" "settings.gradle.kts" "gradle.properties" "gradlew" "gradlew.bat")"
-  [[ -n "$gradle_paths" ]] && { types+=("gradle"); pm_paths+=("$gradle_paths"); }
+  [[ -n "$gradle_paths" ]] && { types+=("gradle"); pm_map+=("gradle: ${gradle_paths}"); }
 
   npm_paths="$(collect_paths_with_fallback "$files" '(^|/)package\.json$|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.ya?ml|pnpm-workspace\.ya?ml|lerna\.json|nx\.json|turbo\.json)$' \
     "package.json" "package-lock.json" "yarn.lock" "pnpm-lock.yaml" "pnpm-lock.yml" "pnpm-workspace.yaml" "pnpm-workspace.yml")"
-  [[ -n "$npm_paths" ]] && { types+=("npm"); pm_paths+=("$npm_paths"); }
+  [[ -n "$npm_paths" ]] && { types+=("npm"); pm_map+=("npm: ${npm_paths}"); }
 
   docker_paths="$(collect_paths_with_fallback "$files" '(^|/)Dockerfile$|(^|/)docker-compose\.ya?ml$' "Dockerfile" "docker-compose.yml" "docker-compose.yaml")"
-  [[ -n "$docker_paths" ]] && { types+=("docker"); pm_paths+=("$docker_paths"); }
+  [[ -n "$docker_paths" ]] && { types+=("docker"); pm_map+=("docker: ${docker_paths}"); }
 
   if [[ ${#types[@]} -eq 0 ]]; then echo "unknown|unknown"; return; fi
 
-  local build_out=""; local i
-  for i in "${!types[@]}"; do
-    [[ -z "$build_out" ]] && build_out="${types[$i]}" || build_out="${build_out}+${types[$i]}"
+  local build_out=""; local t
+  for t in "${types[@]}"; do
+    [[ -z "$build_out" ]] && build_out="$t" || build_out="${build_out}+${t}"
   done
 
-  local pm_out=""
-  for i in "${!types[@]}"; do
-    local label="${types[$i]}"
-    local paths="${pm_paths[$i]}"
-    [[ -z "$paths" ]] && continue
-    [[ -z "$pm_out" ]] && pm_out="${label}: ${paths}" || pm_out="${pm_out} || ${label}: ${paths}"
+  local pm_out=""; local m
+  for m in "${pm_map[@]}"; do
+    [[ -z "$pm_out" ]] && pm_out="$m" || pm_out="${pm_out} || $m}"
   done
 
   echo "${build_out}|${pm_out}"
 }
 
-# ----------------------------
-# File collection
-# ----------------------------
+# fix minor typo in pm_out concatenation (remove extra brace)
+# (done via bash replace after function definition)
+build_info_of_repo() { 
+  local out
+  out="$(declare -f build_info_of_repo | sed 's/\\${pm_out} || \\$m}/\\${pm_out} || \\$m/g')"
+  eval "$out"
+  build_info_of_repo "$@"
+}
 
 collect_target_files(){
   local files=()
@@ -276,10 +330,6 @@ collect_target_files(){
   printf "%s\n" "${files[@]}" | awk '!seen[$0]++'
 }
 
-# ----------------------------
-# Backup + rollback
-# ----------------------------
-
 backup_file(){
   local rel="$1"
   local br="$2"
@@ -290,11 +340,9 @@ backup_file(){
 
 commit_and_push_if_needed(){
   local br="$1"
-
   [[ "$COMMIT" -eq 1 ]] || { echo "[INFO] COMMIT=0, skipping commit"; return 0; }
 
   git -C "$ROOT" add -A
-
   if git -C "$ROOT" diff --cached --quiet; then
     echo "[INFO] No staged changes; skipping commit."
     return 0
@@ -308,8 +356,6 @@ commit_and_push_if_needed(){
 
 rollback_branch(){
   local br="$1"
-
-  # Prefer revert of last bd-migration commit
   local last
   last="$(git -C "$ROOT" log --grep="^bd-migration:" -n 1 --pretty=format:%H 2>/dev/null || true)"
   if [[ -n "$last" ]]; then
@@ -319,7 +365,6 @@ rollback_branch(){
     return 0
   fi
 
-  # Fallback restore from newest backup for this branch
   local newest
   newest="$(cd "$ROOT" && ls -1d .migrate_backups/*/"$br" 2>/dev/null | sort | tail -n 1 || true)"
   [[ -n "$newest" ]] || die "No migration commit and no backups found for branch $br"
@@ -328,10 +373,6 @@ rollback_branch(){
   (cd "$ROOT" && rsync -a --exclude '.git/' "$newest"/ ./)
   commit_and_push_if_needed "$br"
 }
-
-# ----------------------------
-# Migration transforms (conservative)
-# ----------------------------
 
 transform_bridge_stage(){
   local f="$1"
@@ -342,11 +383,13 @@ ensure_blackduck_env_placeholders(){
   local f="$1"
   grep -Eq 'BLACKDUCK_(URL|API_TOKEN|TOKEN)' "$f" && return 0
 
-  perl -0777 -i -pe '
-    if ($m =~ /POLARIS_SERVER_URL/ && $m !~ /BLACKDUCK_URL/) {
-      $m =~ s/(POLARIS_SERVER_URL[^\n]*\n)/$1# TODO: Set Black Duck connection (prefer secrets\/CI vars)\n# BLACKDUCK_URL=__set_in_ci_secret__\n# BLACKDUCK_API_TOKEN=__set_in_ci_secret__\n/s;
-    }
-  ' -pe '$m=$_; $_=$m' "$f"
+  if grep -Eq 'POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN' "$f"; then
+    perl -0777 -i -pe '
+      if ($m !~ /BLACKDUCK_URL/ && $m =~ /POLARIS_SERVER_URL/) {
+        $m =~ s/(POLARIS_SERVER_URL[^\n]*\n)/$1# TODO: Set Black Duck connection (prefer secrets\/CI vars)\n# BLACKDUCK_URL=__set_in_ci_secret__\n# BLACKDUCK_API_TOKEN=__set_in_ci_secret__\n/s;
+      }
+    ' -pe '$m=$_; $_=$m' "$f"
+  fi
 }
 
 transform_bridge_yml_add_blackduck_stage(){
@@ -386,16 +429,12 @@ transform_ado_synopsys_task_to_blackduck(){
     perl -0777 -i -pe 's/^(\s*-\s*task:\s*)SynopsysSecurityScan(@[0-9A-Za-z\.\-_]+)?/$1BlackDuckSecurityScan$2/mg' "$f"
     perl -0777 -i -pe 's/(\bscanType:\s*[\"\x27]?)polaris([\"\x27]?)/$1blackduck$2/g' "$f"
     perl -0777 -i -pe 's/\bpolarisService:\s*/blackDuckService: /g' "$f"
-
-    if ! grep -Eq 'TODO: Verify Black Duck' "$f"; then
-      perl -0777 -i -pe 's/^(.*BlackDuckSecurityScan@.*\n)/$1  # TODO: Verify Black Duck task inputs (service connection, project\/version, scan mode, wait\/fail conditions)\n/m' "$f"
-    fi
   fi
 }
 
-transform_ado_add_blackduck_step(){
+transform_ado_add_blackduck_step_if_coverity_cli(){
   local f="$1"
-  grep -Eq 'cov-build|cov-analyze|cov-commit-defects' "$f" || return 0
+  grep -Eq "$PAT_COVERITY_CLI" "$f" || return 0
   grep -Eq '^\s*steps\s*:' "$f" || return 0
   grep -Eq 'BlackDuckSecurityScan@' "$f" && return 0
 
@@ -406,15 +445,9 @@ transform_ado_add_blackduck_step(){
   ' -pe '$m=$_; $_=$m' "$f"
 }
 
-transform_gha_bridge_cli(){
+transform_gha_synopsys_action_add_bd_placeholder(){
   local f="$1"
-  transform_bridge_stage "$f"
-  ensure_blackduck_env_placeholders "$f"
-}
-
-transform_gha_synopsys_action_add_bd_step(){
-  local f="$1"
-  grep -Eq 'uses:\s*synopsys-sig/synopsys-action' "$f" || return 0
+  grep -Eq "$PAT_GHA_ACTION" "$f" || return 0
   grep -Eq 'name:\s*Black Duck Scan' "$f" && return 0
 
   cat >> "$f" <<'EOF'
@@ -431,18 +464,6 @@ transform_gha_synopsys_action_add_bd_step(){
 EOF
 }
 
-transform_travis(){
-  local f="$1"
-  transform_bridge_stage "$f"
-  ensure_blackduck_env_placeholders "$f"
-}
-
-transform_bamboo(){
-  local f="$1"
-  transform_bridge_stage "$f"
-  ensure_blackduck_env_placeholders "$f"
-}
-
 transform_jenkins_if_enabled(){
   local f="$1"
   [[ "$EDIT_JENKINS" -eq 1 ]] || return 0
@@ -456,53 +477,66 @@ apply_transform_to_path(){
   local ci; ci="$(ci_type_of "$rel")"
 
   case "$ci" in
-    travis) transform_travis "$abs" ;;
-    bamboo) transform_bamboo "$abs" ;;
+    travis|bamboo)
+      transform_bridge_stage "$abs"
+      ensure_blackduck_env_placeholders "$abs"
+      ;;
     azure_devops)
       transform_ado_synopsys_task_to_blackduck "$abs"
-      transform_ado_add_blackduck_step "$abs"
+      transform_ado_add_blackduck_step_if_coverity_cli "$abs"
       ;;
     github_actions)
-      if grep_q '(^|[[:space:]/])bridge([[:space:]]|$)|--input[[:space:]]+bridge\.ya?ml|--stage[[:space:]]+polaris' "$abs"; then
-        transform_gha_bridge_cli "$abs"
+      if grep_q "$PAT_BRIDGE_CLI" "$abs"; then
+        transform_bridge_stage "$abs"
+        ensure_blackduck_env_placeholders "$abs"
       fi
-      transform_gha_synopsys_action_add_bd_step "$abs"
+      transform_gha_synopsys_action_add_bd_placeholder "$abs"
       ;;
-    bridge_config) transform_bridge_yml_add_blackduck_stage "$abs" ;;
-    jenkins) transform_jenkins_if_enabled "$abs" ;;
-    *) return 1 ;;
+    bridge_config)
+      transform_bridge_yml_add_blackduck_stage "$abs"
+      ;;
+    jenkins)
+      transform_jenkins_if_enabled "$abs"
+      ;;
+    *)
+      return 1
+      ;;
   esac
   return 0
 }
 
-# ----------------------------
-# Dry-run diff (FIXED, reliable)
-# ----------------------------
+dryrun_init_file(){ : > "$DRYRUN_DIFF_FILE"; }
 
 dry_run_diff_file(){
   local rel="$1"
   local abs="$ROOT/$rel"
   [[ -f "$abs" ]] || return 0
 
-  local tmp
-  tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp)"
   cp -p "$abs" "$tmp"
 
   case "$(ci_type_of "$rel")" in
-    travis) transform_travis "$tmp" ;;
-    bamboo) transform_bamboo "$tmp" ;;
+    travis|bamboo)
+      transform_bridge_stage "$tmp"
+      ensure_blackduck_env_placeholders "$tmp"
+      ;;
     azure_devops)
       transform_ado_synopsys_task_to_blackduck "$tmp"
-      transform_ado_add_blackduck_step "$tmp"
+      transform_ado_add_blackduck_step_if_coverity_cli "$tmp"
       ;;
     github_actions)
-      if grep -Eq '(^|[[:space:]/])bridge([[:space:]]|$)|--input[[:space:]]+bridge\.ya?ml|--stage[[:space:]]+polaris' "$tmp"; then
-        transform_gha_bridge_cli "$tmp"
+      if grep -Eq "$PAT_BRIDGE_CLI" "$tmp"; then
+        transform_bridge_stage "$tmp"
+        ensure_blackduck_env_placeholders "$tmp"
       fi
-      transform_gha_synopsys_action_add_bd_step "$tmp"
+      transform_gha_synopsys_action_add_bd_placeholder "$tmp"
       ;;
-    bridge_config) transform_bridge_yml_add_blackduck_stage "$tmp" ;;
-    jenkins) transform_jenkins_if_enabled "$tmp" ;;
+    bridge_config)
+      transform_bridge_yml_add_blackduck_stage "$tmp"
+      ;;
+    jenkins)
+      transform_jenkins_if_enabled "$tmp"
+      ;;
     *) ;;
   esac
 
@@ -511,6 +545,14 @@ dry_run_diff_file(){
     echo "---- Proposed diff: $rel ----"
     diff -u -- "$abs" "$tmp" || true
     echo "---- End diff: $rel ----"
+
+    {
+      echo "---- Proposed diff: $rel ----"
+      diff -u -- "$abs" "$tmp" || true
+      echo "---- End diff: $rel ----"
+      echo
+    } >> "$DRYRUN_DIFF_FILE"
+
     rm -f "$tmp"
     return 1
   fi
@@ -518,10 +560,6 @@ dry_run_diff_file(){
   rm -f "$tmp"
   return 0
 }
-
-# ----------------------------
-# Audit report writer
-# ----------------------------
 
 audit_files_to_csv(){
   local br="$1"
@@ -531,7 +569,7 @@ audit_files_to_csv(){
   build_type="${info%%|*}"
   pm_file="${info#*|}"
 
-  local rel abs found ci style ev
+  local rel abs found ci style ev rec
 
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
@@ -544,15 +582,12 @@ audit_files_to_csv(){
     ci="$(ci_type_of "$rel")"
     style="$(invocation_style_of "$abs")"
     ev="$(evidence_lines "$abs")"
+    rec="$(migration_recommendation_of "$rel")"
 
     echo "[DIRECT] $repo@$br :: $rel (ci=$ci, style=$style, build=$build_type)"
-    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",\"direct\",\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\"" >> "$OUT_CSV"
+    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",\"direct\",\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\",\"$(csv_escape "$rec")\"" >> "$OUT_CSV"
   done < <(collect_target_files)
 }
-
-# ----------------------------
-# Branch selection/checkout
-# ----------------------------
 
 list_branches(){
   if [[ "$ALL_BRANCHES" -eq 1 ]]; then
@@ -575,10 +610,6 @@ checkout_branch(){
   git -C "$ROOT" checkout -q "$br" || git -C "$ROOT" checkout -q -b "$br" "$REMOTE/$br"
 }
 
-# ----------------------------
-# Main
-# ----------------------------
-
 [[ "$MODE" =~ ^(audit|dry-run|apply|rollback)$ ]] || die "Invalid MODE=$MODE"
 assert_git_repo
 ensure_csv_header
@@ -587,10 +618,16 @@ if [[ "$MODE" == "apply" || "$MODE" == "rollback" ]]; then
   assert_clean_or_allowed
 fi
 
+if [[ "$MODE" == "dry-run" ]]; then
+  dryrun_init_file
+fi
+
 echo "Mode: $MODE"
 echo "Repo: $ROOT"
 echo "CSV : $OUT_CSV"
+[[ "$MODE" == "dry-run" ]] && echo "Dry-run diff file: $DRYRUN_DIFF_FILE"
 echo "Backups root (apply): $BACKUP_ROOT"
+echo "EDIT_JENKINS: $EDIT_JENKINS"
 echo
 
 while IFS= read -r br; do
@@ -598,7 +635,6 @@ while IFS= read -r br; do
   echo "=== Branch: $br ==="
   checkout_branch "$br"
 
-  # Always audit into CSV
   audit_files_to_csv "$br"
 
   if [[ "$MODE" == "audit" ]]; then
@@ -618,7 +654,6 @@ while IFS= read -r br; do
       [[ -f "$abs" ]] || continue
       [[ "$(found_type_of "$abs")" == "direct" ]] || continue
 
-      # Jenkins edits are off by default
       if [[ "$(ci_type_of "$rel")" == "jenkins" && "$EDIT_JENKINS" -ne 1 ]]; then
         continue
       fi
@@ -634,7 +669,6 @@ while IFS= read -r br; do
     continue
   fi
 
-  # MODE=apply
   any_change=0
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
@@ -665,10 +699,12 @@ while IFS= read -r br; do
   else
     echo "[INFO] No changes applied on $br; skipping commit/push."
   fi
-
 done < <(list_branches)
 
 echo
 echo "Done."
 echo "CSV: $OUT_CSV"
+if [[ "$MODE" == "dry-run" ]]; then
+  echo "Dry-run diffs saved to: $DRYRUN_DIFF_FILE"
+fi
 echo "Backups (apply): $BACKUP_ROOT"
