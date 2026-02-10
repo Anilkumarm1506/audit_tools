@@ -19,38 +19,21 @@ parameters:
   - name: targetBranches
     type: string
     displayName: "Branches (comma-separated). Example: main,develop,release/1.0"
-    default: 'main,develop'
+    default: 'main'
 
   - name: outputCsvName
     type: string
     default: 'synopsys_audit.csv'
 
-  # Only relevant for apply/rollback
-  - name: pushChanges
-    type: boolean
-    default: false
-
-  - name: commitChanges
-    type: boolean
-    default: true
-
-  - name: editJenkins
-    type: boolean
-    default: false
-
-  - name: strictReplace
-    type: boolean
-    default: false
-
 pool:
   vmImage: ubuntu-latest
 
 steps:
-  # 1) Checkout the controller repo (this repo) so we can access the script
+  # 1) Checkout this repo so we can access the migration script
   - checkout: self
     fetchDepth: 1
 
-  # 2) Validate branches, then run chosen MODE sequentially per branch
+  # 2) Validate branches and run mode sequentially
   - bash: |
       set -euo pipefail
       cd "$(Build.SourcesDirectory)"
@@ -59,10 +42,6 @@ steps:
       echo "Target repo URL : ${{ parameters.targetRepoUrl }}"
       echo "Target branches : ${{ parameters.targetBranches }}"
       echo "Output CSV name : ${{ parameters.outputCsvName }}"
-      echo "pushChanges : ${{ parameters.pushChanges }}"
-      echo "commitChanges : ${{ parameters.commitChanges }}"
-      echo "editJenkins : ${{ parameters.editJenkins }}"
-      echo "strictReplace : ${{ parameters.strictReplace }}"
       echo
 
       if [[ -z "${{ parameters.targetRepoUrl }}" ]]; then
@@ -70,26 +49,23 @@ steps:
         exit 1
       fi
 
-      # Script used (must exist in this repo)
       SCRIPT="synopsys_to_blackduck_migrate_v4.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] Missing script: $SCRIPT"
-        echo " Commit the script into this repo or update SCRIPT path."
         exit 1
       fi
       chmod +x "$SCRIPT"
 
-      # Start fresh each pipeline run (CSV is aggregated across branches)
+      # Fresh report each run
       rm -f "${{ parameters.outputCsvName }}"
 
-      # Convert comma-separated list to array + trim spaces
+      # Parse branches list
       IFS=',' read -r -a BRANCHES <<< "${{ parameters.targetBranches }}"
 
       echo "Validating branches exist on remote..."
       VALID_BRANCHES=()
-
       for BR in "${BRANCHES[@]}"; do
-        BR="$(echo "$BR" | xargs)" # trim spaces
+        BR="$(echo "$BR" | xargs)"
         [[ -z "$BR" ]] && continue
 
         if git ls-remote --heads "${{ parameters.targetRepoUrl }}" "$BR" | grep -q "refs/heads/$BR"; then
@@ -106,21 +82,14 @@ steps:
       fi
 
       echo
-      echo "Branches to process (validated): ${VALID_BRANCHES[*]}"
+      echo "Branches to process: ${VALID_BRANCHES[*]}"
       echo
 
-      # Git identity (needed for commit on apply/rollback when commitChanges=true)
-      if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ && "${{ parameters.commitChanges }}" == "True" ]]; then
-        git config --global user.email "ado-pipeline@local"
-        git config --global user.name "ado-pipeline"
-      fi
-
-      # For public GitHub repos: clone works without auth, but push requires PAT.
-      # Provide secret variable GITHUB_TOKEN when pushChanges=true.
-      if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ && "${{ parameters.pushChanges }}" == "True" ]]; then
+      # For apply/rollback we MUST be able to push
+      if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ ]]; then
         if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-          echo "[ERROR] pushChanges=true but GITHUB_TOKEN is not set."
-          echo " Add a secret pipeline variable named GITHUB_TOKEN (GitHub PAT with contents:write)."
+          echo "[ERROR] mode=${{ parameters.mode }} requires pushing changes."
+          echo " Set secret pipeline variable GITHUB_TOKEN (GitHub PAT with contents:write)."
           exit 1
         fi
       fi
@@ -132,36 +101,50 @@ steps:
 
         rm -rf target-repo
 
-        # Clone branch
         git clone --depth 1 --branch "$BR" "${{ parameters.targetRepoUrl }}" target-repo
 
-        # If apply/rollback and pushChanges=true, configure origin URL to include PAT
-        if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ && "${{ parameters.pushChanges }}" == "True" ]]; then
-          # Set identity inside the cloned repo too (safe)
+        # Only configure push auth when needed
+        if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ ]]; then
           git -C target-repo config user.email "ado-pipeline@local"
           git -C target-repo config user.name "ado-pipeline"
 
           ORIGIN="$(git -C target-repo remote get-url origin)"
-
-          # Normalize to https://github.com/org/repo
           ORIGIN="${ORIGIN/git@github.com:/https:\/\/github.com\/}"
           ORIGIN="${ORIGIN/ssh:\/\/git@github.com\//https:\/\/github.com\/}"
           ORIGIN="${ORIGIN%.git}"
 
-          # Set remote with token
           git -C target-repo remote set-url origin "https://${GITHUB_TOKEN}@${ORIGIN#https://}"
-
-          # Optional: ensure we can reach origin
           git -C target-repo ls-remote --heads origin >/dev/null
         fi
 
-        # Run the enhanced script for THIS repo clone, single branch
-        MODE="${{ parameters.mode }}" \
+        # Deterministic behavior by mode (no extra flags)
+        case "${{ parameters.mode }}" in
+          audit)
+            MODE=audit PUSH=0 COMMIT=0 EDIT_JENKINS=0 STRICT_REPLACE=0
+            ;;
+          dry-run)
+            MODE=dry-run PUSH=0 COMMIT=0 EDIT_JENKINS=0 STRICT_REPLACE=0
+            ;;
+          apply)
+            # Apply does: backup + edit + commit + push
+            MODE=apply PUSH=1 COMMIT=1 EDIT_JENKINS=0 STRICT_REPLACE=0
+            ;;
+          rollback)
+            # Rollback does: revert commit + push
+            MODE=rollback PUSH=1 COMMIT=1 EDIT_JENKINS=0 STRICT_REPLACE=0
+            ;;
+          *)
+            echo "[ERROR] Unknown mode: ${{ parameters.mode }}"
+            exit 1
+            ;;
+        esac
+
+        MODE="$MODE" \
         BRANCHES="$BR" \
-        PUSH=$([[ "${{ parameters.pushChanges }}" == "True" ]] && echo 1 || echo 0) \
-        COMMIT=$([[ "${{ parameters.commitChanges }}" == "True" ]] && echo 1 || echo 0) \
-        EDIT_JENKINS=$([[ "${{ parameters.editJenkins }}" == "True" ]] && echo 1 || echo 0) \
-        STRICT_REPLACE=$([[ "${{ parameters.strictReplace }}" == "True" ]] && echo 1 || echo 0) \
+        PUSH="$PUSH" \
+        COMMIT="$COMMIT" \
+        EDIT_JENKINS="$EDIT_JENKINS" \
+        STRICT_REPLACE="$STRICT_REPLACE" \
         ROOT="target-repo" \
         OUT_CSV="$(Build.SourcesDirectory)/${{ parameters.outputCsvName }}" \
         REMOTE="origin" \
@@ -179,12 +162,11 @@ steps:
       echo "Count of DIRECT findings:"
       grep -c ',"direct",' "${{ parameters.outputCsvName }}" || true
     env:
-      # Create this secret variable in Azure DevOps pipeline UI / variable group.
-      # Needed only when pushChanges=true.
+      # Only required for apply/rollback
       GITHUB_TOKEN: $(GITHUB_TOKEN)
-    displayName: "Audit / Dry-run / Apply / Rollback across branches (sequential) + optional git push"
+    displayName: "Run Synopsys -> Black Duck audit/migration by mode (simple UI)"
 
-  # 3) Publish CSV always
+  # 3) Publish report always
   - task: PublishPipelineArtifact@1
     condition: always()
     inputs:
