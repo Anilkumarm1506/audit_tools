@@ -5,7 +5,7 @@ parameters:
   - name: mode
     type: string
     displayName: "Mode"
-    default: 'audit'
+    default: "audit"
     values:
       - audit
       - dry-run
@@ -14,53 +14,65 @@ parameters:
 
   - name: targetRepoUrl
     type: string
-    default: ''
+    displayName: "Target GitHub repo HTTPS URL"
+    default: ""
 
   - name: targetBranches
     type: string
     displayName: "Branches (comma-separated). Example: main,develop,release/1.0"
-    default: 'main'
+    default: "main"
 
   - name: outputCsvName
     type: string
-    default: 'synopsys_audit.csv'
+    displayName: "Output CSV filename"
+    default: "synopsys_audit.csv"
 
 pool:
   vmImage: ubuntu-latest
 
 steps:
-  # 1) Checkout this repo so we can access the migration script
+  # 1) Checkout this repo (audit/migration repo) to access the v6 script
   - checkout: self
     fetchDepth: 1
 
-  # 2) Validate branches and run mode sequentially
+  # 2) Run mode across branches (sequential), produce CSV (+ diffs for dry-run),
+  # and optionally commit/push changes back to GitHub for apply/rollback.
   - bash: |
       set -euo pipefail
+
       cd "$(Build.SourcesDirectory)"
 
-      echo "Mode : ${{ parameters.mode }}"
-      echo "Target repo URL : ${{ parameters.targetRepoUrl }}"
-      echo "Target branches : ${{ parameters.targetBranches }}"
-      echo "Output CSV name : ${{ parameters.outputCsvName }}"
-      echo
+      MODE="${{ parameters.mode }}"
+      TARGET_REPO_URL="${{ parameters.targetRepoUrl }}"
+      TARGET_BRANCHES="${{ parameters.targetBranches }}"
+      OUT_CSV="${{ parameters.outputCsvName }}"
 
-      if [[ -z "${{ parameters.targetRepoUrl }}" ]]; then
+      if [[ -z "$TARGET_REPO_URL" ]]; then
         echo "[ERROR] targetRepoUrl is empty."
         exit 1
       fi
 
-      SCRIPT="synopsys_to_blackduck_migrate_v5.sh"
+      echo "Mode : $MODE"
+      echo "Target repo URL : $TARGET_REPO_URL"
+      echo "Target branches : $TARGET_BRANCHES"
+      echo "Output CSV : $OUT_CSV"
+      echo
+
+      # --- Script path in THIS repo ---
+      SCRIPT="./synopsys_to_blackduck_migrate_v6.sh"
       if [[ ! -f "$SCRIPT" ]]; then
-        echo "[ERROR] Missing script: $SCRIPT"
+        echo "[ERROR] $SCRIPT not found in this repo. Commit it as a .sh file."
         exit 1
       fi
       chmod +x "$SCRIPT"
 
-      # Fresh report each run
-      rm -f "${{ parameters.outputCsvName }}"
+      # Start fresh each pipeline run
+      rm -f "$OUT_CSV"
+      rm -rf artifacts
+      mkdir -p artifacts/diffs artifacts/csv
 
-      # Parse branches list
-      IFS=',' read -r -a BRANCHES <<< "${{ parameters.targetBranches }}"
+      # Convert comma-separated branches to array + trim
+      IFS=',' read -r -a BRANCHES <<< "$TARGET_BRANCHES"
 
       echo "Validating branches exist on remote..."
       VALID_BRANCHES=()
@@ -68,7 +80,7 @@ steps:
         BR="$(echo "$BR" | xargs)"
         [[ -z "$BR" ]] && continue
 
-        if git ls-remote --heads "${{ parameters.targetRepoUrl }}" "$BR" | grep -q "refs/heads/$BR"; then
+        if git ls-remote --heads "$TARGET_REPO_URL" "$BR" | grep -q "refs/heads/$BR"; then
           echo "[OK] $BR"
           VALID_BRANCHES+=("$BR")
         else
@@ -77,7 +89,7 @@ steps:
       done
 
       if [[ ${#VALID_BRANCHES[@]} -eq 0 ]]; then
-        echo "[ERROR] None of the provided branches exist on remote. Exiting."
+        echo "[ERROR] None of the provided branches exist on remote."
         exit 1
       fi
 
@@ -85,92 +97,105 @@ steps:
       echo "Branches to process: ${VALID_BRANCHES[*]}"
       echo
 
-      # For apply/rollback we MUST be able to push
-      if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ ]]; then
-        if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-          echo "[ERROR] mode=${{ parameters.mode }} requires pushing changes."
-          echo " Set secret pipeline variable GITHUB_TOKEN (GitHub PAT with contents:write)."
-          exit 1
-        fi
+      # Helper: build authenticated URL if GITHUB_TOKEN is present (needed for apply/rollback)
+      # IMPORTANT: Create a secret pipeline variable named GITHUB_TOKEN (see notes below).
+      AUTH_URL="$TARGET_REPO_URL"
+      if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        # Convert https://github.com/org/repo(.git) -> https://x-access-token:TOKEN@github.com/org/repo(.git)
+        AUTH_URL="$(echo "$TARGET_REPO_URL" | sed -E "s#^https://github.com/#https://x-access-token:${GITHUB_TOKEN}@github.com/#")"
       fi
 
+      # Configure git identity for commits (apply/rollback). Safe even for audit/dry-run.
+      git config --global user.email "azure-pipelines@local"
+      git config --global user.name "azure-pipelines"
+
+      # Decide clone depth: rollback should be full history (revert needs it)
+      CLONE_DEPTH="--depth 50"
+      if [[ "$MODE" == "rollback" ]]; then
+        CLONE_DEPTH="" # full clone for reliable revert
+      fi
+
+      # Loop branches sequentially
       for BR in "${VALID_BRANCHES[@]}"; do
         echo "============================================================"
         echo "Processing branch: $BR"
         echo "============================================================"
 
         rm -rf target-repo
-
-        git clone --depth 1 --branch "$BR" "${{ parameters.targetRepoUrl }}" target-repo
-
-        # Only configure push auth when needed
-        if [[ "${{ parameters.mode }}" =~ ^(apply|rollback)$ ]]; then
-          git -C target-repo config user.email "ado-pipeline@local"
-          git -C target-repo config user.name "ado-pipeline"
-
-          ORIGIN="$(git -C target-repo remote get-url origin)"
-          ORIGIN="${ORIGIN/git@github.com:/https:\/\/github.com\/}"
-          ORIGIN="${ORIGIN/ssh:\/\/git@github.com\//https:\/\/github.com\/}"
-          ORIGIN="${ORIGIN%.git}"
-
-          git -C target-repo remote set-url origin "https://${GITHUB_TOKEN}@${ORIGIN#https://}"
-          git -C target-repo ls-remote --heads origin >/dev/null
+        # NOTE: for apply/rollback, AUTH_URL should include token (otherwise push will fail)
+        # We don't echo AUTH_URL to avoid leaking token in logs.
+        if [[ -n "$CLONE_DEPTH" ]]; then
+          git clone $CLONE_DEPTH --single-branch --branch "$BR" "$AUTH_URL" target-repo
+        else
+          git clone --single-branch --branch "$BR" "$AUTH_URL" target-repo
         fi
 
-        # Deterministic behavior by mode (no extra flags)
-        case "${{ parameters.mode }}" in
-          audit)
-            MODE=audit PUSH=0 COMMIT=0 EDIT_JENKINS=0 STRICT_REPLACE=0
-            ;;
-          dry-run)
-            MODE=dry-run PUSH=0 COMMIT=0 EDIT_JENKINS=0 STRICT_REPLACE=0
-            ;;
-          apply)
-            # Apply does: backup + edit + commit + push
-            MODE=apply PUSH=1 COMMIT=1 EDIT_JENKINS=0 STRICT_REPLACE=0
-            ;;
-          rollback)
-            # Rollback does: revert commit + push
-            MODE=rollback PUSH=1 COMMIT=1 EDIT_JENKINS=0 STRICT_REPLACE=0
-            ;;
-          *)
-            echo "[ERROR] Unknown mode: ${{ parameters.mode }}"
-            exit 1
-            ;;
-        esac
+        # If we used a shallow clone and later need more history, fetch more (safe no-op for audit)
+        (cd target-repo && git fetch --prune --tags || true)
 
-        MODE="$MODE" \
-        BRANCHES="$BR" \
-        PUSH="$PUSH" \
-        COMMIT="$COMMIT" \
-        EDIT_JENKINS="$EDIT_JENKINS" \
-        STRICT_REPLACE="$STRICT_REPLACE" \
-        ROOT="target-repo" \
-        OUT_CSV="$(Build.SourcesDirectory)/${{ parameters.outputCsvName }}" \
-        REMOTE="origin" \
-        "./$SCRIPT"
+        # Per-branch diff file for dry-run
+        DIFF_FILE="$(Build.SourcesDirectory)/artifacts/diffs/dryrun_${BR//\//_}.diff.txt"
+
+        # Run v6 script inside the cloned repo
+        # - OUT_CSV points to a single consolidated file in the pipeline workspace
+        # - For apply/rollback, set COMMIT=1 PUSH=1 so it commits & pushes to GitHub
+        export ROOT="target-repo"
+        export OUT_CSV="$(Build.SourcesDirectory)/$OUT_CSV"
+        export MODE="$MODE"
+        export DRYRUN_DIFF_FILE="$DIFF_FILE"
+
+        if [[ "$MODE" == "apply" || "$MODE" == "rollback" ]]; then
+          # Require token for push
+          if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            echo "[ERROR] GITHUB_TOKEN is not set. Create a secret pipeline variable named GITHUB_TOKEN."
+            exit 1
+          fi
+          export COMMIT=1
+          export PUSH=1
+        else
+          export COMMIT=0
+          export PUSH=0
+        fi
+
+        # Run
+        bash -x "$SCRIPT"
+
+        # Keep artifacts
+        if [[ "$MODE" == "dry-run" ]]; then
+          # DIFF_FILE already created (may be empty)
+          ls -la "$(dirname "$DIFF_FILE")" || true
+        fi
 
         echo
       done
 
+      # Copy CSV into artifacts folder for publishing
+      cp -f "$OUT_CSV" "artifacts/csv/$OUT_CSV"
+
       echo "============================================================"
-      echo "Final consolidated CSV preview:"
+      echo "CSV preview (top 30):"
       echo "============================================================"
-      head -n 50 "${{ parameters.outputCsvName }}" || true
+      head -n 30 "$OUT_CSV" || true
 
       echo
       echo "Count of DIRECT findings:"
-      grep -c ',"direct",' "${{ parameters.outputCsvName }}" || true
-    env:
-      # Only required for apply/rollback
-      GITHUB_TOKEN: $(GITHUB_TOKEN)
-    displayName: "Run Synopsys -> Black Duck audit/migration by mode (simple UI)"
+      grep -c ',direct,' "$OUT_CSV" || true
+    displayName: "Run v6 across branches (audit/dry-run/apply/rollback)"
 
-  # 3) Publish report always
+  # 3) Publish CSV always
   - task: PublishPipelineArtifact@1
     condition: always()
     inputs:
-      targetPath: '$(Build.SourcesDirectory)/${{ parameters.outputCsvName }}'
-      artifact: 'synopsys-migration-report'
+      targetPath: '$(Build.SourcesDirectory)/artifacts/csv'
+      artifact: 'synopsys-blackduck-audit-csv'
       publishLocation: 'pipeline'
-    displayName: "Publish consolidated report CSV (always)"
+    displayName: "Publish CSV artifact (always)"
+
+  # 4) Publish diffs only for dry-run (still safe to publish always; will be empty if not used)
+  - task: PublishPipelineArtifact@1
+    condition: always()
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/artifacts/diffs'
+      artifact: 'dryrun-diffs'
+      publishLocation: 'pipeline'
+    displayName: "Publish dry-run diffs artifact"
