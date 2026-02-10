@@ -49,7 +49,7 @@ steps:
         exit 1
       fi
 
-      SCRIPT="synopsys_to_blackduck_migrate_v4.sh"
+      SCRIPT="synopsys_to_blackduck_migrate_v5.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] Missing script: $SCRIPT"
         exit 1
