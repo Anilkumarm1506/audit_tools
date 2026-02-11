@@ -59,7 +59,7 @@ steps:
       echo
 
       # --- Script path in THIS repo ---
-      SCRIPT="./synopsys_to_blackduck_migrate_v6_1.sh"
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_2.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] $SCRIPT not found in this repo. Commit it as a .sh file."
         exit 1
@@ -134,7 +134,7 @@ steps:
         (cd target-repo && git fetch --prune --tags || true)
 
         # Per-branch diff file for dry-run
-        DIFF_FILE="$(Build.SourcesDirectory)/artifacts/diffs/dryrun_${BR//\//_}.diff.txt"
+        DIFF_FILE="artifacts/diffs/dryrun_${BR//\//_}.diff.txt"
 
         # Run v6 script inside the cloned repo
         # - OUT_CSV points to a single consolidated file in the pipeline workspace
