@@ -59,7 +59,7 @@ steps:
       echo
 
       # --- Script path in THIS repo ---
-      SCRIPT="./synopsys_to_blackduck_migrate_v6.sh"
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_1.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] $SCRIPT not found in this repo. Commit it as a .sh file."
         exit 1
