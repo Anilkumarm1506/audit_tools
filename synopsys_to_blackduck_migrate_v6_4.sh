@@ -1,8 +1,21 @@
+synopsys_to_blackduck_migrate_v6_4.sh.txt
+
+
+Anil Kumar M
+
+​
+Anil Kumar M​
+
+
+Get Outlook for Android
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_to_blackduck_migrate_v6_3.sh
+# Script: synopsys_to_blackduck_migrate_v6_4.sh
+# Fixes vs v6:
+#   - Removes the self-redefining build_info_of_repo() recursion that caused exit code 139
+#   - Corrects build_type/package_manager_file join formatting (no stray brace)
 # ============================================================
 
 ROOT="${ROOT:-.}"
@@ -157,67 +170,105 @@ evidence_lines(){
 }
 
 migration_changes_of(){
-  # For audit/apply/rollback we keep this column empty by default.
-  # For dry-run we embed the proposed unified diff for the file (escaped for CSV).
+  # v6.4 (Option 1): Return a semantic, reviewer-friendly migration summary.
+  # This is intended for audit/dry-run reporting (no raw unified diff, no temp paths).
   local rel="$1"
   [[ "$MODE" == "dry-run" ]] || { echo ""; return 0; }
 
   local abs="$ROOT/$rel"
   [[ -f "$abs" ]] || { echo ""; return 0; }
 
-  local tmp; tmp="$(mktemp)"
-  cp -p "$abs" "$tmp"
+  local ci; ci="$(ci_type_of "$rel")"
+  local summary=""
 
-  case "$(ci_type_of "$rel")" in
-    travis|bamboo)
-      transform_bridge_stage "$tmp"
-      ensure_blackduck_env_placeholders "$tmp"
-      ;;
+  # Helpers
+  _add(){ local line="$1"; [[ -z "$summary" ]] && summary="$line" || summary+=$'\n'"$line"; }
+  _kv(){ local k="$1"; local v="$2"; [[ -n "$v" ]] && _add "  - $k: $v"; }
+
+  case "$ci" in
     azure_devops)
-      transform_ado_synopsys_task_to_blackduck "$tmp"
-      transform_ado_add_blackduck_step_if_coverity_cli "$tmp"
+      if grep_q "$PAT_ADO_TASK" "$abs" && grep_q "scanType:[[:space:]]*'?polaris'?" "$abs"; then
+        _add "Change: Replace Synopsys Polaris task with Black Duck task (Azure DevOps Extension)"
+        _add "Action:"
+        _add "  - Replace: SynopsysSecurityScan@1"
+        _add "  - With   : BlackDuckSecurityScan@1"
+        _add "  - Update inputs mapping:"
+        _add "      scanType: 'polaris'  ->  scanType: 'blackduck'"
+        _add "      polarisService       ->  blackDuckService (keep same service connection name/value)"
+        _add "      projectName / branchName / waitForScan: keep as-is"
+        _add "Notes:"
+        _add "  - Ensure service connection has Black Duck entitlement/permissions."
+        _add "  - Ensure required Black Duck URL/token are configured in the service connection or pipeline variables."
+      elif grep_q "$PAT_COVERITY_CLI" "$abs"; then
+        _add "Change: Replace direct Coverity CLI workflow with Black Duck (Polaris) execution"
+        _add "Action:"
+        _add "  - Preferred: Use BlackDuckSecurityScan@1 (scanType: 'blackduck')"
+        _add "  - Alternative: Use Synopsys Bridge CLI with --stage blackduck and a bridge.yml blackduck stage"
+        _add "Notes:"
+        _add "  - Coverity CLI (cov-build/cov-analyze/cov-commit-defects) usually targets Coverity Connect."
+        _add "  - For 'Black Duck Coverity in Polaris', ensure pipeline uses Polaris/Bridge/ADO extension path, not Connect commit-defects."
+      fi
       ;;
     github_actions)
-      if grep -Eq "$PAT_BRIDGE_CLI" "$tmp"; then
-        transform_bridge_stage "$tmp"
-        ensure_blackduck_env_placeholders "$tmp"
+      if grep_q "$PAT_GHA_ACTION" "$abs"; then
+        _add "Change: Update GitHub Action config from Polaris to Black Duck (Synopsys Action)"
+        _add "Action:"
+        _add "  - Keep: synopsys-sig/synopsys-action@v1"
+        _add "  - Replace inputs:"
+        _add "      polaris_*  ->  blackduck_* (use BLACKDUCK_URL + BLACKDUCK_API_TOKEN secrets)"
+        _add "  - Keep checkout step and job structure"
+        _add "Notes:"
+        _add "  - Store secrets in GitHub repo/org secrets."
+      elif grep_q "$PAT_BRIDGE_CLI" "$abs"; then
+        _add "Change: Switch Bridge CLI stage from Polaris to Black Duck (GitHub Actions)"
+        _add "Action:"
+        _add "  - Update command: bridge --stage polaris  ->  bridge --stage blackduck"
+        _add "  - Update bridge.yml: add/use stage.blackduck"
+        _add "  - Add secrets: BLACKDUCK_URL, BLACKDUCK_API_TOKEN"
       fi
-      transform_gha_synopsys_action_add_bd_placeholder "$tmp"
+      ;;
+    travis|bamboo)
+      if grep_q "$PAT_BRIDGE_CLI" "$abs"; then
+        _add "Change: Switch Bridge CLI stage from Polaris to Black Duck"
+        _add "Action:"
+        _add "  - Update command: bridge --stage polaris  ->  bridge --stage blackduck"
+        _add "  - Update bridge.yml: add/use stage.blackduck"
+        _add "  - Add env vars/secrets: BLACKDUCK_URL, BLACKDUCK_API_TOKEN"
+      fi
       ;;
     bridge_config)
-      transform_bridge_yml_add_blackduck_stage "$tmp"
+      if grep_q "^[[:space:]]*polaris[[:space:]]*:" "$abs"; then
+        _add "Change: Add Black Duck stage to bridge.yml and keep Polaris stage (if still needed)"
+        _add "Action:"
+        _add "  - Add: stage.blackduck section"
+        _add "  - Configure:"
+        _add "      url: ${BLACKDUCK_URL}"
+        _add "      apiToken: ${BLACKDUCK_API_TOKEN}"
+        _add "Notes:"
+        _add "  - Keep stage.polaris only if legacy Polaris scans still required."
+      fi
       ;;
     jenkins)
-      transform_jenkins_if_enabled "$tmp"
+      _add "Change: Jenkinsfile detected. Script does not auto-edit Jenkins by default."
+      _add "Action:"
+      _add "  - Re-run with EDIT_JENKINS=1 to enable Jenkinsfile transformations (if supported by your Jenkins setup)."
+      _add "  - Otherwise migrate manually: replace Polaris/Bridge steps with Black Duck stage or supported plugin step."
       ;;
-    *) ;;
+    *)
+      ;;
   esac
 
-  if diff -u -- "$abs" "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"
-    echo ""
-    return 0
-  fi
-
-  local d
-  d="$(diff -u -- "$abs" "$tmp" || true)"
-  rm -f "$tmp"
-
-  local max="${MAX_MIGRATION_DIFF_CHARS:-12000}"
-  if [[ ${#d} -gt $max ]]; then
-    d="${d:0:$max}"$'\n...TRUNCATED (set MAX_MIGRATION_DIFF_CHARS to increase)...'
-  fi
-
-  printf '%s' "$d"
+  printf '%s' "$summary"
 }
 
-# Escape for CSV but preserve newlines as literal \n so diffs remain readable.
+# Escape for CSV but preserve newlines as literal \n so summaries remain readable.
 csv_escape_nl(){
   printf '%s' "$1" \
     | sed -E 's/"/""/g' \
     | sed ':a;N;$!ba;s/\r//g;s/\n/\\n/g' \
     | sed -E 's/[[:space:]]+$//'
 }
+
 
 
 repo_file_index(){
