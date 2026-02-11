@@ -2,57 +2,14 @@
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_to_blackduck_migrate_v6.sh
-# Purpose:
-#   - Audit Synopsys/Polaris/Coverity/Bridge usage across common CI configs
-#   - Dry-run: show diffs (and save to a diff artifact file)
-#   - Apply: backup -> transform -> commit -> push
-#   - Rollback: git revert last migration commit OR restore from latest backups
-#
-# Modes (MODE):
-#   - audit     : scan & write CSV only
-#   - dry-run   : scan & write CSV + print diffs + save diffs to a file
-#   - apply     : scan & write CSV + apply edits + (optional) commit/push
-#   - rollback  : revert last migration commit (or restore backup) + (optional) push
-#
-# Key improvements over v5:
-#   ✅ invocation_style is MULTI-VALUED (no more losing signal when file has both CLI + plugin)
-#   ✅ build_type and package_manager_file formatting cleaned + stable for monorepos
-#   ✅ dry-run diffs are saved to a single artifact file (DRYRUN_DIFF_FILE)
-#   ✅ optional migration_recommendation column in CSV (actionable audit report)
-#
-# Safety notes:
-#   - Jenkins edits are OFF by default (EDIT_JENKINS=0). Many Jenkins setups need manual validation.
-#   - Transforms are conservative; placeholders are added where exact org config is unknown.
-#
-# Typical local usage:
-#   MODE=audit    ROOT=./repo OUT_CSV=out.csv BRANCHES="main,dev" ./synopsys_to_blackduck_migrate_v6.sh
-#   MODE=dry-run  ROOT=./repo OUT_CSV=out.csv BRANCHES="main"     ./synopsys_to_blackduck_migrate_v6.sh
-#   MODE=apply    ROOT=./repo OUT_CSV=out.csv BRANCHES="main" COMMIT=1 PUSH=1 ./synopsys_to_blackduck_migrate_v6.sh
-#   MODE=rollback ROOT=./repo BRANCHES="main" COMMIT=1 PUSH=1 ./synopsys_to_blackduck_migrate_v6.sh
-#
-# Env:
-#   ROOT=path-to-git-repo                       (default ".")
-#   MODE=audit|dry-run|apply|rollback           (default audit)
-#   OUT_CSV=csv filename                        (default synopsys_audit.csv)
-#   DRYRUN_DIFF_FILE=diff filename              (default dryrun_diffs.txt) [only in dry-run]
-#   BRANCHES="comma,separated,branches"         (optional; default current branch)
-#   ALL_BRANCHES=1                              (optional; scan all remote branches)
-#   REMOTE=origin                               (default origin)
-#   COMMIT=1|0                                  (default 0; set 1 for apply/rollback)
-#   PUSH=1|0                                    (default 0; set 1 to push)
-#   ALLOW_DIRTY=1|0                             (default 0; require clean working tree for apply/rollback)
-#   EDIT_JENKINS=1|0                            (default 0; enable Jenkinsfile transformations)
-#   MAX_PM_PATHS_PER_TYPE=10                    (default 10)
-#
-# Output:
-#   - OUT_CSV: consolidated report
-#   - .migrate_backups/<timestamp>/<branch>/... (apply backups)
-#   - DRYRUN_DIFF_FILE (dry-run)                (unified diffs)
+# Script: synopsys_to_blackduck_migrate_v6_1.sh
+# Fixes vs v6:
+#   - Removes the self-redefining build_info_of_repo() recursion that caused exit code 139
+#   - Corrects build_type/package_manager_file join formatting (no stray brace)
 # ============================================================
 
 ROOT="${ROOT:-.}"
-MODE="${MODE:-audit}"
+MODE="${MODE:-audit}"                       # audit|dry-run|apply|rollback
 OUT_CSV="${OUT_CSV:-synopsys_audit.csv}"
 DRYRUN_DIFF_FILE="${DRYRUN_DIFF_FILE:-dryrun_diffs.txt}"
 
@@ -83,10 +40,6 @@ PIPELINE_GLOBS=(
   "Jenkinsfile" "Jenkinsfile*"
 )
 
-# ----------------------------
-# Patterns (detection)
-# ----------------------------
-
 DIRECT_PATTERN='polaris|coverity|coverity-on-polaris|cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-format-errors|synopsys[- ]?bridge|bridge(\.exe)?|bridge\.yml|bridge\.yaml|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|--input[[:space:]]+bridge\.ya?ml|synopsys-sig/synopsys-action|SynopsysSecurityScan@|BlackDuckSecurityScan@|CoverityOnPolaris|withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
 
 PAT_GHA_ACTION='uses:\s*synopsys-sig/synopsys-action'
@@ -98,10 +51,6 @@ PAT_POLARIS_ENV='POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|polaris_server_url|pola
 PAT_BRIDGE_CONFIG='^\s*stage:\s*$|^\s*polaris\s*:|^\s*blackduck\s*:'
 
 ENV_MARKERS_PATTERN='POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN|COVERITY_URL|COVERITY_STREAM|BLACKDUCK_URL|BLACKDUCK_API_TOKEN|BLACKDUCK_TOKEN|blackDuckService|polarisService'
-
-# ----------------------------
-# Helpers
-# ----------------------------
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 grep_q(){ grep -Eq "$1" -- "$2" 2>/dev/null; }
@@ -304,19 +253,10 @@ build_info_of_repo(){
 
   local pm_out=""; local m
   for m in "${pm_map[@]}"; do
-    [[ -z "$pm_out" ]] && pm_out="$m" || pm_out="${pm_out} || $m}"
+    [[ -z "$pm_out" ]] && pm_out="$m" || pm_out="${pm_out} || ${m}"
   done
 
   echo "${build_out}|${pm_out}"
-}
-
-# fix minor typo in pm_out concatenation (remove extra brace)
-# (done via bash replace after function definition)
-build_info_of_repo() { 
-  local out
-  out="$(declare -f build_info_of_repo | sed 's/\\${pm_out} || \\$m}/\\${pm_out} || \\$m/g')"
-  eval "$out"
-  build_info_of_repo "$@"
 }
 
 collect_target_files(){
@@ -334,7 +274,7 @@ backup_file(){
   local rel="$1"
   local br="$2"
   local dst="$BACKUP_ROOT/$br/$rel"
-  mkdir -p "$(dirname "$ROOT/$dst")"
+  mkdir -p "$ROOT/$(dirname "$dst")"
   cp -p "$ROOT/$rel" "$ROOT/$dst"
 }
 
@@ -427,7 +367,7 @@ transform_ado_synopsys_task_to_blackduck(){
   local f="$1"
   if grep -Eq '^\s*-\s*task:\s*SynopsysSecurityScan@' "$f"; then
     perl -0777 -i -pe 's/^(\s*-\s*task:\s*)SynopsysSecurityScan(@[0-9A-Za-z\.\-_]+)?/$1BlackDuckSecurityScan$2/mg' "$f"
-    perl -0777 -i -pe 's/(\bscanType:\s*[\"\x27]?)polaris([\"\x27]?)/$1blackduck$2/g' "$f"
+    perl -0777 -i -pe 's/(\bscanType:\s*["\x27]?)polaris(["\x27]?)/$1blackduck$2/g' "$f"
     perl -0777 -i -pe 's/\bpolarisService:\s*/blackDuckService: /g' "$f"
   fi
 }
@@ -498,9 +438,7 @@ apply_transform_to_path(){
     jenkins)
       transform_jenkins_if_enabled "$abs"
       ;;
-    *)
-      return 1
-      ;;
+    *) return 1 ;;
   esac
   return 0
 }
@@ -585,7 +523,7 @@ audit_files_to_csv(){
     rec="$(migration_recommendation_of "$rel")"
 
     echo "[DIRECT] $repo@$br :: $rel (ci=$ci, style=$style, build=$build_type)"
-    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",\"direct\",\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\",\"$(csv_escape "$rec")\"" >> "$OUT_CSV"
+    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",direct,\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\",\"$(csv_escape "$rec")\"" >> "$OUT_CSV"
   done < <(collect_target_files)
 }
 
