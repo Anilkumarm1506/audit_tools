@@ -2,10 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_to_blackduck_migrate_v6_4.sh
-# Fixes vs v6:
-#   - Removes the self-redefining build_info_of_repo() recursion that caused exit code 139
-#   - Corrects build_type/package_manager_file join formatting (no stray brace)
+# Script: synopsys_to_blackduck_migrate_v6_6.sh
 # ============================================================
 
 ROOT="${ROOT:-.}"
@@ -14,8 +11,6 @@ OUT_CSV="${OUT_CSV:-synopsys_audit.csv}"
 
 # ------------------------------------------------------------
 # v6.2 fix: Normalize OUT_CSV path ONCE to avoid double-prefix
-# - If OUT_CSV is relative, make it absolute using current working dir
-# - If already absolute, keep as-is
 # ------------------------------------------------------------
 if [[ "${OUT_CSV}" != /* ]]; then
   OUT_CSV="$(pwd)/${OUT_CSV}"
@@ -36,7 +31,6 @@ MAX_PM_PATHS_PER_TYPE="${MAX_PM_PATHS_PER_TYPE:-10}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 MIGRATE_TAG="bd-migration:${TS}"
-BACKUP_ROOT=".migrate_backups/${TS}"
 
 shopt -s globstar nullglob
 
@@ -160,7 +154,7 @@ evidence_lines(){
 }
 
 migration_changes_of(){
-  # v6.4 (Option 1): Return a semantic, reviewer-friendly migration summary.
+  # v6.5 (Option 1): Return a semantic, reviewer-friendly migration summary.
   # This is intended for audit/dry-run reporting (no raw unified diff, no temp paths).
   local rel="$1"
   [[ "$MODE" == "dry-run" ]] || { echo ""; return 0; }
@@ -342,10 +336,10 @@ collect_target_files(){
 
 backup_file(){
   local rel="$1"
-  local br="$2"
-  local dst="$BACKUP_ROOT/$br/$rel"
-  mkdir -p "$ROOT/$(dirname "$dst")"
-  cp -p "$ROOT/$rel" "$ROOT/$dst"
+  local src="$ROOT/$rel"
+  local bak="${src}.bak_${TS}"
+  cp -p "$src" "$bak"
+  echo "$bak"
 }
 
 commit_and_push_if_needed(){
@@ -366,121 +360,64 @@ commit_and_push_if_needed(){
 
 rollback_branch(){
   local br="$1"
-  local last
-  last="$(git -C "$ROOT" log --grep="^bd-migration:" -n 1 --pretty=format:%H 2>/dev/null || true)"
-  if [[ -n "$last" ]]; then
-    echo "[ROLLBACK] Reverting $last on $br"
-    git -C "$ROOT" revert --no-edit "$last"
-    [[ "$PUSH" -eq 1 ]] && git -C "$ROOT" push "$REMOTE" "HEAD:$br"
-    return 0
-  fi
 
-  local newest
-  newest="$(cd "$ROOT" && ls -1d .migrate_backups/*/"$br" 2>/dev/null | sort | tail -n 1 || true)"
-  [[ -n "$newest" ]] || die "No migration commit and no backups found for branch $br"
+  # v6.6 behavior (in-place backups):
+  # - NO `git revert`
+  # - Restore files from the latest per-file backup: <file>.bak_<timestamp>
+  # - Remove newly-created migration files (files without any backup) if they contain Black Duck markers
 
-  echo "[ROLLBACK] Restoring from backup dir: $newest"
-  (cd "$ROOT" && rsync -a --exclude '.git/' "$newest"/ ./)
-  commit_and_push_if_needed "$br"
+  local restored_any=0
+
+  # 1) Restore backups for targeted files
+  local rel
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    local cur="$ROOT/$rel"
+    local pat="$cur.bak_"'*'
+    local latest_bak=""
+
+    # Find latest backup by lexicographic sort (YYYYMMDD_HHMMSS sorts correctly)
+    latest_bak="$(ls -1 $pat 2>/dev/null | sort | tail -n 1 || true)"
+    [[ -n "$latest_bak" ]] || continue
+
+    # Delete current migrated file and move backup into place
+    rm -f "$cur" 2>/dev/null || true
+    if mv -f "$latest_bak" "$cur" 2>/dev/null; then
+      echo "[ROLLBACK] Restored: $rel (from $(basename "$latest_bak"))"
+      restored_any=1
+    else
+      # Cross-device fallback
+      cp -f "$latest_bak" "$cur"
+      rm -f "$latest_bak" || true
+      echo "[ROLLBACK] Restored (cp): $rel (from $(basename "$latest_bak"))"
+      restored_any=1
+    fi
+  done < <(collect_target_files)
+
+  # 2) Delete newly created migration files among targeted files (no backup exists)
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    local cur="$ROOT/$rel"
+    [[ -f "$cur" ]] || continue
+
+    # If any backup exists, do not delete (it was present before apply)
+    if ls -1 "$cur".bak_* >/dev/null 2>&1; then
+      continue
+    fi
+
+    # Safety: only delete if it looks introduced by migration
+    if grep -Eq 'bd-migration:|BlackDuckSecurityScan@|scanType:\s*blackduck|--stage[[:space:]]+blackduck|BLACKDUCK_(URL|API_TOKEN|TOKEN)' "$cur" 2>/dev/null; then
+      rm -f "$cur"
+      echo "[ROLLBACK] Removed newly created migration file: $rel"
+      restored_any=1
+    fi
+  done < <(collect_target_files)
+
+  [[ "$restored_any" -eq 1 ]] || echo "[INFO] No in-place backups found; nothing to rollback."
 }
 
-transform_bridge_stage(){
-  local f="$1"
-  perl -0777 -i -pe 's/(--stage\s+)polaris\b/$1blackduck/g' "$f"
-}
 
-ensure_blackduck_env_placeholders(){
-  local f="$1"
-  grep -Eq 'BLACKDUCK_(URL|API_TOKEN|TOKEN)' "$f" && return 0
-
-  if grep -Eq 'POLARIS_SERVER_URL|POLARIS_ACCESS_TOKEN' "$f"; then
-    perl -0777 -i -pe '
-      if ($m !~ /BLACKDUCK_URL/ && $m =~ /POLARIS_SERVER_URL/) {
-        $m =~ s/(POLARIS_SERVER_URL[^\n]*\n)/$1# TODO: Set Black Duck connection (prefer secrets\/CI vars)\n# BLACKDUCK_URL=__set_in_ci_secret__\n# BLACKDUCK_API_TOKEN=__set_in_ci_secret__\n/s;
-      }
-    ' -pe '$m=$_; $_=$m' "$f"
-  fi
-}
-
-transform_bridge_yml_add_blackduck_stage(){
-  local f="$1"
-  grep -Eq '^\s*blackduck\s*:' "$f" && return 0
-
-  if grep -Eq '^\s*stage:\s*$' "$f" && grep -Eq '^\s*polaris\s*:' "$f"; then
-    cat >> "$f" <<'EOF'
-
-  # --- Added by migration script (placeholder) ---
-  blackduck:
-    # TODO: set these via CI secrets/environment variables
-    url: "${BLACKDUCK_URL}"
-    apiToken: "${BLACKDUCK_API_TOKEN}"
-    project:
-      name: "juice-shop"   # TODO: align with your BD project name
-      version: "main"      # TODO: align with your BD version naming
-EOF
-    return 0
-  fi
-
-  if grep -Eq '^\s*polaris\s*:' "$f"; then
-    cat >> "$f" <<'EOF'
-
-# --- Added by migration script (placeholder) ---
-# TODO: This file did not match expected "stage:" layout; review placement/indentation.
-blackduck:
-  url: "${BLACKDUCK_URL}"
-  apiToken: "${BLACKDUCK_API_TOKEN}"
-EOF
-  fi
-}
-
-transform_ado_synopsys_task_to_blackduck(){
-  local f="$1"
-  if grep -Eq '^\s*-\s*task:\s*SynopsysSecurityScan@' "$f"; then
-    perl -0777 -i -pe 's/^(\s*-\s*task:\s*)SynopsysSecurityScan(@[0-9A-Za-z\.\-_]+)?/$1BlackDuckSecurityScan$2/mg' "$f"
-    perl -0777 -i -pe 's/(\bscanType:\s*["\x27]?)polaris(["\x27]?)/$1blackduck$2/g' "$f"
-    perl -0777 -i -pe 's/\bpolarisService:\s*/blackDuckService: /g' "$f"
-  fi
-}
-
-transform_ado_add_blackduck_step_if_coverity_cli(){
-  local f="$1"
-  grep -Eq "$PAT_COVERITY_CLI" "$f" || return 0
-  grep -Eq '^\s*steps\s*:' "$f" || return 0
-  grep -Eq 'BlackDuckSecurityScan@' "$f" && return 0
-
-  perl -0777 -i -pe '
-    if ($m =~ /-\s*checkout:\s*self.*?\n/s && $m !~ /BlackDuckSecurityScan@/s) {
-      $m =~ s/(-\s*checkout:\s*self[^\n]*\n(?:\s*clean:\s*true[^\n]*\n)?)/$1\n- task: BlackDuckSecurityScan@1\n  displayName: "Black Duck SCA Scan (Added by migration script)"\n  inputs:\n    # TODO: configure according to your extension inputs\n    blackDuckService: "BlackDuck-Service-Connection"\n    projectName: "juice-shop"\n    versionName: "$(Build.SourceBranchName)"\n    waitForScan: true\n\n/s;
-    }
-  ' -pe '$m=$_; $_=$m' "$f"
-}
-
-transform_gha_synopsys_action_add_bd_placeholder(){
-  local f="$1"
-  grep -Eq "$PAT_GHA_ACTION" "$f" || return 0
-  grep -Eq 'name:\s*Black Duck Scan' "$f" && return 0
-
-  cat >> "$f" <<'EOF'
-
-# --- Added by migration script (placeholder) ---
-# TODO: Add your org-approved Black Duck scan step.
-# - name: Black Duck Scan
-#   uses: <org-approved-blackduck-action>@<version>
-#   with:
-#     blackduck.url: ${{ secrets.BLACKDUCK_URL }}
-#     blackduck.api.token: ${{ secrets.BLACKDUCK_API_TOKEN }}
-#     blackduck.project.name: juice-shop
-#     blackduck.project.version: ${{ github.ref_name }}
-EOF
-}
-
-transform_jenkins_if_enabled(){
-  local f="$1"
-  [[ "$EDIT_JENKINS" -eq 1 ]] || return 0
-  transform_bridge_stage "$f"
-  ensure_blackduck_env_placeholders "$f"
-}
-
+apply_transform_to_path
 apply_transform_to_path(){
   local rel="$1"
   local abs="$ROOT/$rel"
@@ -628,7 +565,7 @@ echo "Mode: $MODE"
 echo "Repo: $ROOT"
 echo "CSV : $OUT_CSV"
 [[ "$MODE" == "dry-run" ]] && echo "Dry-run diff file: $DRYRUN_DIFF_FILE"
-echo "Backups root (apply): $BACKUP_ROOT"
+echo "Backups (apply): <in-place .bak_${TS}>"
 echo "EDIT_JENKINS: $EDIT_JENKINS"
 echo
 
@@ -683,13 +620,13 @@ while IFS= read -r br; do
       continue
     fi
 
-    backup_file "$rel" "$br"
+    bak_path="$(backup_file "$rel")"
     before="$(sha1sum "$abs" | awk '{print $1}')"
     apply_transform_to_path "$rel" || true
     after="$(sha1sum "$abs" | awk '{print $1}')"
 
     if [[ "$before" != "$after" ]]; then
-      echo "[APPLY] Updated: $rel (backup: $BACKUP_ROOT/$br/$rel)"
+      echo "[APPLY] Updated: $rel (backup: ${bak_path#$ROOT/})"
       any_change=1
     else
       echo "[INFO] No changes for: $rel"
@@ -709,4 +646,4 @@ echo "CSV: $OUT_CSV"
 if [[ "$MODE" == "dry-run" ]]; then
   echo "Dry-run diffs saved to: $DRYRUN_DIFF_FILE"
 fi
-echo "Backups (apply): $BACKUP_ROOT"
+echo "Backups (apply): <in-place .bak_${TS}>"
