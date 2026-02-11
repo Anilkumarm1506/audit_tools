@@ -2,10 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# Script: synopsys_to_blackduck_migrate_v6_2.sh
-# Fixes vs v6:
-#   - Removes the self-redefining build_info_of_repo() recursion that caused exit code 139
-#   - Corrects build_type/package_manager_file join formatting (no stray brace)
+# Script: synopsys_to_blackduck_migrate_v6_3.sh
 # ============================================================
 
 ROOT="${ROOT:-.}"
@@ -72,7 +69,7 @@ csv_escape(){
 
 ensure_csv_header(){
   if [[ ! -s "$OUT_CSV" ]]; then
-    echo "repo,branch,build_type,package_manager_file,file_path,ci_type,found_type,invocation_style,evidence,migration_recommendation" > "$OUT_CSV"
+    echo "repo,branch,build_type,package_manager_file,file_path,ci_type,found_type,invocation_style,evidence,migration_changes" > "$OUT_CSV"
   fi
 }
 
@@ -159,47 +156,69 @@ evidence_lines(){
   )
 }
 
-migration_recommendation_of(){
+migration_changes_of(){
+  # For audit/apply/rollback we keep this column empty by default.
+  # For dry-run we embed the proposed unified diff for the file (escaped for CSV).
   local rel="$1"
+  [[ "$MODE" == "dry-run" ]] || { echo ""; return 0; }
+
   local abs="$ROOT/$rel"
-  local ci; ci="$(ci_type_of "$rel")"
+  [[ -f "$abs" ]] || { echo ""; return 0; }
 
-  if [[ "$ci" == "jenkins" && "$EDIT_JENKINS" -ne 1 ]]; then
-    echo "Manual Jenkins review required (EDIT_JENKINS=0). Consider Bridge stage change or Jenkins plugin migration."
-    return
+  local tmp; tmp="$(mktemp)"
+  cp -p "$abs" "$tmp"
+
+  case "$(ci_type_of "$rel")" in
+    travis|bamboo)
+      transform_bridge_stage "$tmp"
+      ensure_blackduck_env_placeholders "$tmp"
+      ;;
+    azure_devops)
+      transform_ado_synopsys_task_to_blackduck "$tmp"
+      transform_ado_add_blackduck_step_if_coverity_cli "$tmp"
+      ;;
+    github_actions)
+      if grep -Eq "$PAT_BRIDGE_CLI" "$tmp"; then
+        transform_bridge_stage "$tmp"
+        ensure_blackduck_env_placeholders "$tmp"
+      fi
+      transform_gha_synopsys_action_add_bd_placeholder "$tmp"
+      ;;
+    bridge_config)
+      transform_bridge_yml_add_blackduck_stage "$tmp"
+      ;;
+    jenkins)
+      transform_jenkins_if_enabled "$tmp"
+      ;;
+    *) ;;
+  esac
+
+  if diff -u -- "$abs" "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo ""
+    return 0
   fi
 
-  if grep_q "$PAT_ADO_TASK" "$abs" && grep_q 'SynopsysSecurityScan@' "$abs"; then
-    echo "Replace SynopsysSecurityScan with BlackDuckSecurityScan; update service connection + scanType."
-    return
+  local d
+  d="$(diff -u -- "$abs" "$tmp" || true)"
+  rm -f "$tmp"
+
+  local max="${MAX_MIGRATION_DIFF_CHARS:-12000}"
+  if [[ ${#d} -gt $max ]]; then
+    d="${d:0:$max}"$'\n...TRUNCATED (set MAX_MIGRATION_DIFF_CHARS to increase)...'
   fi
 
-  if grep_q "$PAT_COVERITY_CLI" "$abs" && [[ "$ci" == "azure_devops" ]]; then
-    echo "Keep Coverity CLI SAST; add BlackDuckSecurityScan for SCA (service/project/version)."
-    return
-  fi
-
-  if grep_q "$PAT_BRIDGE_CLI" "$abs"; then
-    echo "Switch Bridge CLI --stage polaris -> blackduck; ensure BLACKDUCK_URL/API_TOKEN secrets."
-    return
-  fi
-
-  if grep_q "$PAT_GHA_ACTION" "$abs"; then
-    echo "Add org-approved Black Duck scan step/action with secrets (SCA) alongside Synopsys action as needed."
-    return
-  fi
-
-  if [[ "$ci" == "bridge_config" ]]; then
-    echo "Add Black Duck stage block to bridge.yml (url/apiToken/project/version placeholders)."
-    return
-  fi
-
-  echo "Review required; no migration rule matched."
+  printf '%s' "$d"
 }
 
-# ----------------------------
-# Build detection (monorepo-aware)
-# ----------------------------
+# Escape for CSV but preserve newlines as literal \n so diffs remain readable.
+csv_escape_nl(){
+  printf '%s' "$1" \
+    | sed -E 's/"/""/g' \
+    | sed ':a;N;$!ba;s/\r//g;s/\n/\\n/g' \
+    | sed -E 's/[[:space:]]+$//'
+}
+
 
 repo_file_index(){
   git -C "$ROOT" ls-files --cached --others --exclude-standard 2>/dev/null || true
@@ -453,7 +472,7 @@ apply_transform_to_path(){
   return 0
 }
 
-dryrun_init_file(){ : > "$DRYRUN_DIFF_FILE"; }
+dryrun_init_file(){ :; }
 
 dry_run_diff_file(){
   local rel="$1"
@@ -494,13 +513,7 @@ dry_run_diff_file(){
     diff -u -- "$abs" "$tmp" || true
     echo "---- End diff: $rel ----"
 
-    {
-      echo "---- Proposed diff: $rel ----"
-      diff -u -- "$abs" "$tmp" || true
-      echo "---- End diff: $rel ----"
-      echo
-    } >> "$DRYRUN_DIFF_FILE"
-
+    
     rm -f "$tmp"
     return 1
   fi
@@ -517,7 +530,7 @@ audit_files_to_csv(){
   build_type="${info%%|*}"
   pm_file="${info#*|}"
 
-  local rel abs found ci style ev rec
+  local rel abs found ci style ev chg
 
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
@@ -530,10 +543,10 @@ audit_files_to_csv(){
     ci="$(ci_type_of "$rel")"
     style="$(invocation_style_of "$abs")"
     ev="$(evidence_lines "$abs")"
-    rec="$(migration_recommendation_of "$rel")"
+    chg="$(migration_changes_of "$rel")"
 
     echo "[DIRECT] $repo@$br :: $rel (ci=$ci, style=$style, build=$build_type)"
-    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",direct,\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\",\"$(csv_escape "$rec")\"" >> "$OUT_CSV"
+    echo "\"$(csv_escape "$repo")\",\"$(csv_escape "$br")\",\"$(csv_escape "$build_type")\",\"$(csv_escape "$pm_file")\",\"$(csv_escape "$rel")\",\"$(csv_escape "$ci")\",direct,\"$(csv_escape "$style")\",\"$(csv_escape "$ev")\",\"$(csv_escape_nl "$chg")\"" >> "$OUT_CSV"
   done < <(collect_target_files)
 }
 
