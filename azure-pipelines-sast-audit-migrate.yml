@@ -140,7 +140,7 @@ steps:
         # - OUT_CSV points to a single consolidated file in the pipeline workspace
         # - For apply/rollback, set COMMIT=1 PUSH=1 so it commits & pushes to GitHub
         export ROOT="target-repo"
-        export OUT_CSV="$(Build.SourcesDirectory)/$OUT_CSV"
+        export OUT_CSV="$OUT_CSV"
         export MODE="$MODE"
         export DRYRUN_DIFF_FILE="$DIFF_FILE"
 
