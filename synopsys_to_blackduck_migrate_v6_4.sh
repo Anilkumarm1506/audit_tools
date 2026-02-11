@@ -1,13 +1,3 @@
-synopsys_to_blackduck_migrate_v6_4.sh.txt
-
-
-Anil Kumar M
-
-​
-Anil Kumar M​
-
-
-Get Outlook for Android
 #!/usr/bin/env bash
 set -euo pipefail
 
