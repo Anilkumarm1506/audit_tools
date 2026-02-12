@@ -56,7 +56,7 @@ steps:
       echo "Output CSV : $OUT_CSV"
       echo
 
-      SCRIPT="./synopsys_to_blackduck_migrate_v6_6.sh"
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_6_1.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] $SCRIPT not found in repo."
         exit 1
