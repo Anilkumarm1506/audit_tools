@@ -3,6 +3,9 @@ set -euo pipefail
 
 # ============================================================
 # Script: synopsys_to_blackduck_migrate_v6_6.sh
+# Fixes vs v6:
+#   - Removes the self-redefining build_info_of_repo() recursion that caused exit code 139
+#   - Corrects build_type/package_manager_file join formatting (no stray brace)
 # ============================================================
 
 ROOT="${ROOT:-.}"
@@ -11,6 +14,8 @@ OUT_CSV="${OUT_CSV:-synopsys_audit.csv}"
 
 # ------------------------------------------------------------
 # v6.2 fix: Normalize OUT_CSV path ONCE to avoid double-prefix
+# - If OUT_CSV is relative, make it absolute using current working dir
+# - If already absolute, keep as-is
 # ------------------------------------------------------------
 if [[ "${OUT_CSV}" != /* ]]; then
   OUT_CSV="$(pwd)/${OUT_CSV}"
@@ -417,7 +422,6 @@ rollback_branch(){
 }
 
 
-apply_transform_to_path
 apply_transform_to_path(){
   local rel="$1"
   local abs="$ROOT/$rel"
