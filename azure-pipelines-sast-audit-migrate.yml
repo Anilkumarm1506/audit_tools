@@ -25,17 +25,15 @@ parameters:
   - name: outputCsvName
     type: string
     displayName: "Output CSV filename"
-    default: "synopsys_report.csv"
+    default: "synopsys_blackduck_migration.csv"
 
 pool:
   vmImage: ubuntu-latest
 
 steps:
-  # 1️⃣ Checkout this repo (audit/migration repo)
   - checkout: self
     fetchDepth: 1
 
-  # 2️⃣ Run v6.3 script across branches
   - bash: |
       set -euo pipefail
       cd "$(Build.SourcesDirectory)"
@@ -46,73 +44,55 @@ steps:
       OUT_CSV="${{ parameters.outputCsvName }}"
 
       if [[ -z "$TARGET_REPO_URL" ]]; then
-        echo "[ERROR] targetRepoUrl is empty."
+        echo "[ERROR] targetRepoUrl is empty"
         exit 1
       fi
 
-      echo "Mode : $MODE"
-      echo "Target repo URL : $TARGET_REPO_URL"
-      echo "Target branches : $TARGET_BRANCHES"
-      echo "Output CSV : $OUT_CSV"
+      echo "Mode           : $MODE"
+      echo "Target Repo    : $TARGET_REPO_URL"
+      echo "Branches       : $TARGET_BRANCHES"
+      echo "CSV            : $OUT_CSV"
       echo
 
-      SCRIPT="./synopsys_to_blackduck_migrate_v6_6_1.sh"
-      if [[ ! -f "$SCRIPT" ]]; then
-        echo "[ERROR] $SCRIPT not found in repo."
-        exit 1
-      fi
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_7.sh"
       chmod +x "$SCRIPT"
 
-      # Clean workspace outputs
       rm -f "$OUT_CSV"
-      rm -rf artifacts
-      mkdir -p artifacts/csv
 
-      # Parse branches
       IFS=',' read -r -a BRANCHES <<< "$TARGET_BRANCHES"
-      VALID_BRANCHES=()
 
-      echo "Validating branches exist on remote..."
+      VALID_BRANCHES=()
       for BR in "${BRANCHES[@]}"; do
         BR="$(echo "$BR" | xargs)"
         [[ -z "$BR" ]] && continue
+
         if git ls-remote --heads "$TARGET_REPO_URL" "$BR" | grep -q "refs/heads/$BR"; then
-          echo "[OK] $BR"
           VALID_BRANCHES+=("$BR")
         else
-          echo "[WARN] $BR not found. Skipping."
+          echo "[WARN] Branch not found: $BR"
         fi
       done
 
       if [[ ${#VALID_BRANCHES[@]} -eq 0 ]]; then
-        echo "[ERROR] No valid branches found."
+        echo "[ERROR] No valid branches"
         exit 1
       fi
 
-      echo
-      echo "Branches to process: ${VALID_BRANCHES[*]}"
-      echo
-
-      # Auth setup for apply / rollback
       AUTH_URL="$TARGET_REPO_URL"
-      if [[ "$MODE" == "apply" || "$MODE" == "rollback" ]]; then
-        if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-          echo "[ERROR] GITHUB_TOKEN is required for apply/rollback."
-          exit 1
-        fi
+      if [[ -n "${GITHUB_TOKEN:-}" ]]; then
         AUTH_URL="$(echo "$TARGET_REPO_URL" | sed -E "s#^https://github.com/#https://x-access-token:${GITHUB_TOKEN}@github.com/#")"
-        git config --global user.email "azure-pipelines@local"
-        git config --global user.name "azure-pipelines"
       fi
 
-      # Clone & process each branch
+      git config --global user.email "azure-pipelines@local"
+      git config --global user.name "azure-pipelines"
+
       for BR in "${VALID_BRANCHES[@]}"; do
-        echo "============================================================"
+        echo "===================================================="
         echo "Processing branch: $BR"
-        echo "============================================================"
+        echo "===================================================="
 
         rm -rf target-repo
-        git clone --depth 1 --branch "$BR" "$AUTH_URL" target-repo
+        git clone --single-branch --branch "$BR" "$AUTH_URL" target-repo
 
         export ROOT="target-repo"
         export MODE="$MODE"
@@ -126,31 +106,20 @@ steps:
           export PUSH=0
         fi
 
-        bash -x "$SCRIPT"
+        bash "$SCRIPT"
         echo
       done
 
-      # Prepare artifact
-      cp -f "$OUT_CSV" "artifacts/csv/$OUT_CSV"
-
-      echo "============================================================"
+      echo "===================================================="
       echo "CSV preview:"
-      echo "============================================================"
+      echo "===================================================="
       head -n 30 "$OUT_CSV" || true
+    displayName: "Run Synopsys → Black Duck migration (v6_7)"
 
-      echo
-      echo "Count of DIRECT findings:"
-      grep -c ',direct,' "$OUT_CSV" || true
-    displayName: "Run Synopsys → Black Duck migration (v6.3)"
-
-    env:
-      GITHUB_TOKEN: $(GITHUB_TOKEN)
-
-  # 3️⃣ Publish CSV artifact (single source of truth)
   - task: PublishPipelineArtifact@1
     condition: always()
     inputs:
-      targetPath: '$(Build.SourcesDirectory)/artifacts/csv'
-      artifact: 'synopsys-blackduck-audit-csv'
+      targetPath: '$(Build.SourcesDirectory)/${{ parameters.outputCsvName }}'
+      artifact: 'synopsys-blackduck-migration-report'
       publishLocation: 'pipeline'
-    displayName: "Publish consolidated audit CSV"
+    displayName: "Publish migration CSV"
