@@ -54,7 +54,7 @@ steps:
       echo "CSV            : $OUT_CSV"
       echo
 
-      SCRIPT="./synopsys_to_blackduck_migrate_v6_7.sh"
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_7_1.sh"
       chmod +x "$SCRIPT"
 
       rm -f "$OUT_CSV"
