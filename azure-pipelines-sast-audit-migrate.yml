@@ -59,7 +59,7 @@ steps:
 
       # ---- Script in THIS repo ----
       # Update this filename if you rename the script in your repo
-      SCRIPT="./synopsys_to_blackduck_migrate_v6_7_1.sh"
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_7_2.sh"
       if [[ ! -f "$SCRIPT" ]]; then
         echo "[ERROR] Script not found: $SCRIPT"
         echo "       Commit the script as a .sh file in this repo at that path, or update SCRIPT variable."
