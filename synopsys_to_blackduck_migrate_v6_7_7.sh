@@ -170,6 +170,7 @@ ci_type_of_path() {
 
 invocation_style_of_file() {
   local f="$1"
+
   if grep -Eq "$PAT_GHA_ACTION" -- "$f"; then echo "github_action_synopsys_action"; return; fi
   if grep -Eq "$PAT_ADO_TASK" -- "$f"; then
     if grep -Eq "SynopsysSecurityScan@" -- "$f"; then echo "ado_task_synopsys_security_scan"; return; fi
@@ -180,6 +181,13 @@ invocation_style_of_file() {
   if grep -Eq "$PAT_BRIDGE_CLI" -- "$f"; then echo "bridge_cli"; return; fi
   if grep -Eq "$PAT_COVERITY_CLI" -- "$f"; then echo "coverity_cli"; return; fi
   if grep -Eq "$PAT_JENKINS_PLUGIN" -- "$f"; then echo "jenkins_coverity_plugin"; return; fi
+
+  # NEW: detect "polaris:" config block in YAML
+  if grep -Eq '^[[:space:]]*polaris:' -- "$f"; then
+    echo "polaris_config"
+    return
+  fi
+
   echo "unknown"
 }
 
