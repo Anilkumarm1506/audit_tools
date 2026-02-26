@@ -2,17 +2,20 @@
 set -euo pipefail
 
 # ============================================================================
-# Script: synopsys_to_blackduck_migrate_v6_7_5.sh
+# Script: synopsys_to_blackduck_migrate_v6_7_6.sh
 # Purpose:
 #   Audit / Dry-run / Apply / Rollback Synopsys (Polaris / Coverity-on-Polaris)
 #   configurations to Black Duck / Coverity patterns across common CI files.
 #
-# v6_7_5 fix (per your latest rollback result):
-#   - Rollback MUST remove the backup file from the repo.
-#     * We restore by MOVING azure-pipelines_backup.yml(.yaml) back to azure-pipelines.yml(.yaml)
-#       so the backup file disappears from disk.
-#     * We also make sure the deletion is staged for git by including the backup path in the
-#       staged path list AND using `git add -A -- <paths>` during commit.
+# v6_7_6 updates:
+#   - Dry-run CSV "migration_changes" now omits diff headers (---/+++/@@).
+#   - Apply & Dry-run: Update polarisService URL domain
+#       https://<tenant>.polaris.synopsys.com  -->  https://<tenant>.polaris.blackduck.com
+#   - Normalize doubled quotes in displayName (""Title"") -> "Title".
+#
+# v6_7_5 (previous) fixes:
+#   - Rollback removes backup from the repo by moving it back into place and
+#     staging deletion via `git add -A -- <paths>`.
 #
 # Modes:
 #   MODE=audit      : scan & write CSV findings only
@@ -153,11 +156,52 @@ evidence_of_file() {
 }
 
 # ---------------- Azure pipeline transform logic ----------------
+# Common transforms used by both dry-run and apply
+ado_common_transforms() {
+  local file="$1"
+
+  # Task swap & naming tweaks
+  sed -Ei \
+    -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
+    -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
+    -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
+    "$file" 2>/dev/null || true
+
+  # Bridge build type if present
+  sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$file" 2>/dev/null || true
+
+  # If legacy keys appear, rewrite to Black Duck analogs (rare in this path)
+  if grep -Eq '^[[:space:]]*polaris_server_url:' "$file"; then
+    sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$file" 2>/dev/null || true
+  fi
+  if grep -Eq '^[[:space:]]*polaris_access_token:' "$file"; then
+    sed -Ei -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' "$file" 2>/dev/null || true
+  fi
+
+  # Copy edits naming
+  sed -Ei \
+    -e 's/Synopsys Bridge: Coverity on Polaris/Synopsys Bridge: Black Duck Coverity/g' \
+    -e 's/Black Duck Coverity on Polaris/Black Duck Coverity/g' \
+    "$file" 2>/dev/null || true
+
+  # *** NEW: Update polarisService URL domain if a URL is provided (POC cases) ***
+  # Example: polarisService: 'https://yourorg.polaris.synopsys.com'  ->  https://yourorg.polaris.blackduck.com
+  sed -Ei -e 's#(polarisService:[[:space:]]*["'\'']?)https://([A-Za-z0-9._-]+)\.polaris\.synopsys\.com#\1https://\2.polaris.blackduck.com#g' "$file" 2>/dev/null || true
+
+  # *** NEW: Normalize doubled quotes in displayName ***
+  # From: displayName: ""Black Duck SAST Scan""  -> displayName: "Black Duck SAST Scan"
+  sed -Ei \
+    -e 's/(displayName:[[:space:]]*)"([^"]*)""/\1"\2"/g' \
+    -e 's/(displayName:[[:space:]]*)""/\1"/g' \
+    "$file" 2>/dev/null || true
+}
+
 ado_apply_transform_azure_pipelines() {
   local rel="$1"
   local abs="$ROOT/$rel"
   [[ -f "$abs" ]] || return 1
 
+  # Only attempt if Synopsys/Polaris markers appear (broad match includes 'polaris' token)
   if ! grep -Eq "SynopsysBridge@|SynopsysSecurityScan@|polaris" -- "$abs"; then
     return 1
   fi
@@ -166,26 +210,7 @@ ado_apply_transform_azure_pipelines() {
   tmp="$(mktemp)"
   cp -f "$abs" "$tmp"
 
-  sed -Ei \
-    -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
-    -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
-    -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
-    "$tmp" 2>/dev/null || true
-
-  sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$tmp" 2>/dev/null || true
-
-  if grep -Eq '^[[:space:]]*polaris_server_url:' "$tmp"; then
-    sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$tmp" 2>/dev/null || true
-  fi
-
-  if grep -Eq '^[[:space:]]*polaris_access_token:' "$tmp"; then
-    sed -Ei -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' "$tmp" 2>/dev/null || true
-  fi
-
-  sed -Ei \
-    -e 's/Synopsys Bridge: Coverity on Polaris/Synopsys Bridge: Black Duck Coverity/g' \
-    -e 's/Black Duck Coverity on Polaris/Black Duck Coverity/g' \
-    "$tmp" 2>/dev/null || true
+  ado_common_transforms "$tmp"
 
   if cmp -s "$abs" "$tmp"; then
     rm -f "$tmp"
@@ -284,7 +309,7 @@ migration_changes_for_file() {
       return
     fi
     if grep -Eq "SynopsysSecurityScan@" -- "$abs"; then
-      echo "Replace SynopsysSecurityScan@* (scanType: polaris) with BlackDuckSecurityScan@* (scanType: blackduck) OR your org's Black Duck ADO task. Validate service connection fields."
+      echo "Replace SynopsysSecurityScan@* (scanType: polaris) with BlackDuckSecurityScan@* (scanType: blackduck). Validate service connection fields or POLARIS_* variables."
       return
     fi
     echo "Detected Synopsys/Polaris/Coverity markers. Review and migrate to Black Duck / Coverity patterns as per org standards."
@@ -298,20 +323,13 @@ migration_changes_for_file() {
     cp -f "$abs" "$tmp"
     cp -f "$tmp" "$transformed"
 
-    sed -Ei \
-      -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
-      -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
-      -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
-      "$transformed" 2>/dev/null || true
-    sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$transformed" 2>/dev/null || true
-    if grep -Eq '^[[:space:]]*polaris_server_url:' "$transformed"; then
-      sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$transformed" 2>/dev/null || true
-    fi
-    if grep -Eq '^[[:space:]]*polaris_access_token:' "$transformed"; then
-      sed -Ei -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' "$transformed" 2>/dev/null || true
-    fi
+    # Apply the same transforms we would in APPLY
+    ado_common_transforms "$transformed"
 
-    d="$(diff -u "$tmp" "$transformed" | head -n 200 || true)"
+    # Create unified diff and strip header lines (--- / +++ / @@)
+    d="$(diff -u "$tmp" "$transformed" \
+        | sed '/^--- /d; /^\+\+\+ /d; /^@@/d' \
+        | head -n 200 || true)"
     rm -f "$tmp" "$transformed"
     echo "${d:-NO_DIFF}"
     return
@@ -357,7 +375,7 @@ commit_and_push_if_needed() {
     return 0
   fi
 
-  git -C "$ROOT" commit -m "Synopsys â†’ Black Duck migration (${MODE}) [${TS}]" || true
+  git -C "$ROOT" commit -m "Synopsys -> Black Duck migration (${MODE}) [${TS}]" || true
 
   if [[ "$PUSH" == "1" ]]; then
     set_remote_with_token_for_push
