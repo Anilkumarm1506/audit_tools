@@ -2,43 +2,32 @@
 set -euo pipefail
 
 # ============================================================================
-# Script: synopsys_to_blackduck_migrate_v6_7_4.sh
+# Script: synopsys_to_blackduck_migrate_v6_7_5.sh
 # Purpose:
-#   Audit / Dry-run / Apply / Rollback migration of Synopsys (Polaris / Coverity-on-Polaris)
-#   footprints to Black Duck / Coverity-in-Polaris patterns across common CI files.
+#   Audit / Dry-run / Apply / Rollback Synopsys (Polaris / Coverity-on-Polaris)
+#   configurations to Black Duck / Coverity patterns across common CI files.
 #
-# Key behaviors (v6.7.4):
-#   - Modes: audit | dry-run | apply | rollback
-#   - CSV columns:
-#       repo,branch,build_type,package_manager_file,file_path,ci_type,found_type,
-#       invocation_style,evidence,migration_changes
-#   - Dry-run: last column contains a unified diff (truncated to 200 lines) for that file.
-#   - Apply:
-#       * For azure-pipelines.y*ml:
-#           - Create a FIXED in-place backup file: azure-pipelines_backup.yml (or .yaml)
-#           - Overwrite azure-pipelines.yml with migrated content (same name)
-#   - Rollback:
-#       * For azure-pipelines.y*ml:
-#           - Delete migrated azure-pipelines.yml
-#           - Restore azure-pipelines_backup.yml -> azure-pipelines.yml
-#           - Delete azure-pipelines_backup.yml after restore (so no leftovers)
-#   - Commit/Push safety:
-#       * Only stages changed pipeline/config files (never CSV)
-#       * If PUSH=1, requires GITHUB_TOKEN and rewrites remote URL to token form before push.
+# v6_7_5 fix (per your latest rollback result):
+#   - Rollback MUST remove the backup file from the repo.
+#     * We restore by MOVING azure-pipelines_backup.yml(.yaml) back to azure-pipelines.yml(.yaml)
+#       so the backup file disappears from disk.
+#     * We also make sure the deletion is staged for git by including the backup path in the
+#       staged path list AND using `git add -A -- <paths>` during commit.
 #
-# Env inputs:
-#   ROOT (default: .)     - path to cloned target repo
-#   MODE (required)       - audit|dry-run|apply|rollback
-#   OUT_CSV (required)    - output CSV path (absolute recommended)
-#   COMMIT (default: 0)   - 1 to commit changes
-#   PUSH (default: 0)     - 1 to push changes
+# Modes:
+#   MODE=audit      : scan & write CSV findings only
+#   MODE=dry-run    : scan & write CSV + include proposed diff as last column
+#   MODE=apply      : write changes + create azure-pipelines_backup.yml(.yaml) + (optional) commit/push
+#   MODE=rollback   : restore from azure-pipelines_backup.yml(.yaml) and DELETE backup + (optional) commit/push
+#
+# Env inputs (set by your Azure pipeline step):
+#   ROOT (default: .)       - path to cloned target repo
+#   MODE (required)         - audit|dry-run|apply|rollback
+#   OUT_CSV (required)      - output CSV path (absolute recommended; outside repo)
+#   COMMIT (default: 0)     - 1 to commit changes
+#   PUSH (default: 0)       - 1 to push changes
 #   REMOTE (default: origin)
-#   GITHUB_TOKEN          - required if PUSH=1
-#
-# Notes:
-#   - This script targets Azure DevOps YAML files for auto-apply/rollback,
-#     but still reports other CI footprints in audit/dry-run.
-#   - Edits are conservative and intended to be a mechanical starting point.
+#   GITHUB_TOKEN (required for PUSH=1) - GitHub PAT/token for HTTPS pushes
 # ============================================================================
 
 ROOT="${ROOT:-.}"
@@ -70,13 +59,7 @@ PIPELINE_GLOBS=(
 log(){ echo "$@" >&2; }
 die(){ echo "[ERROR] $*" >&2; exit 1; }
 
-grep_q() { # grep_q PATTERN FILE
-  local pat="$1"; local f="$2"
-  grep -Eq "$pat" -- "$f"
-}
-
 csv_escape() {
-  # RFC4180-ish: wrap in quotes, double internal quotes, strip CR
   local s="${1//$'\r'/}"
   s="${s//\"/\"\"}"
   printf '"%s"' "$s"
@@ -112,7 +95,6 @@ current_branch() {
   echo "${b:-unknown}"
 }
 
-# Very small "build info" heuristic
 build_info_of_repo() {
   local bt="unknown"
   local pm=()
@@ -148,20 +130,19 @@ ci_type_of_path() {
 
 invocation_style_of_file() {
   local f="$1"
-  if grep_q "$PAT_GHA_ACTION" "$f"; then echo "github_action_synopsys_action"; return; fi
-  if grep_q "$PAT_ADO_TASK" "$f"; then
-    if grep_q "SynopsysSecurityScan@" "$f"; then echo "ado_task_synopsys_security_scan"; return; fi
-    if grep_q "SynopsysBridge@" "$f"; then echo "ado_task_synopsys_bridge"; return; fi
-    if grep_q "BlackDuckSecurityScan@" "$f"; then echo "ado_task_blackduck_security_scan"; return; fi
+  if grep -Eq "$PAT_GHA_ACTION" -- "$f"; then echo "github_action_synopsys_action"; return; fi
+  if grep -Eq "$PAT_ADO_TASK" -- "$f"; then
+    if grep -Eq "SynopsysSecurityScan@" -- "$f"; then echo "ado_task_synopsys_security_scan"; return; fi
+    if grep -Eq "SynopsysBridge@" -- "$f"; then echo "ado_task_synopsys_bridge"; return; fi
+    if grep -Eq "BlackDuckSecurityScan@" -- "$f"; then echo "ado_task_blackduck_security_scan"; return; fi
     echo "ado_task_extension"; return
   fi
-  if grep_q "$PAT_BRIDGE_CLI" "$f"; then echo "bridge_cli"; return; fi
-  if grep_q "$PAT_COVERITY_CLI" "$f"; then echo "coverity_cli"; return; fi
-  if grep_q "$PAT_JENKINS_PLUGIN" "$f"; then echo "jenkins_coverity_plugin"; return; fi
+  if grep -Eq "$PAT_BRIDGE_CLI" -- "$f"; then echo "bridge_cli"; return; fi
+  if grep -Eq "$PAT_COVERITY_CLI" -- "$f"; then echo "coverity_cli"; return; fi
+  if grep -Eq "$PAT_JENKINS_PLUGIN" -- "$f"; then echo "jenkins_coverity_plugin"; return; fi
   echo "unknown"
 }
 
-# Evidence: line-numbered matched lines (limited)
 evidence_of_file() {
   local f="$1"
   local pat='polaris|coverity|SynopsysSecurityScan@|SynopsysBridge@|BlackDuckSecurityScan@|synopsys-sig/synopsys-action|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|cov-build|cov-analyze|cov-commit-defects'
@@ -172,101 +153,62 @@ evidence_of_file() {
 }
 
 # ---------------- Azure pipeline transform logic ----------------
-# For azure-pipelines.y*ml:
-#   - SynopsysBridge@1:
-#       bridge_build_type: "polaris" -> "blackduck"
-#       polaris_server_url -> blackduck_url: "$(BLACKDUCK_URL)"
-#       polaris_access_token -> blackduck_api_token: "$(BLACKDUCK_TOKEN)"
-#   - SynopsysSecurityScan@* task:
-#       SynopsysSecurityScan@N -> BlackDuckSecurityScan@N
-#       scanType: 'polaris' -> 'blackduck'
-#
-# Apply file handling (your requirement):
-#   - Create azure-pipelines_backup.yml/.yaml (fixed name) with ORIGINAL content
-#   - Overwrite azure-pipelines.yml/.yaml with migrated content (same name)
-#
-# Rollback:
-#   - Delete migrated azure-pipelines.yml/.yaml
-#   - Restore backup azure-pipelines_backup.yml/.yaml -> azure-pipelines.yml/.yaml
-#   - Delete azure-pipelines_backup.* after restoring (no leftovers)
-
-ado_transform_content() {
-  # args: in_file out_file
-  local in_f="$1"
-  local out_f="$2"
-  cp -f "$in_f" "$out_f"
-
-  # Synopsys Security Scan task transform (best effort)
-  sed -Ei \
-    -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
-    -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
-    -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
-    "$out_f" 2>/dev/null || true
-
-  # Synopsys Bridge task transform (best effort)
-  sed -Ei \
-    -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' \
-    "$out_f" 2>/dev/null || true
-
-  # Keys: polaris_server_url -> blackduck_url
-  if grep -Eq '^[[:space:]]*polaris_server_url:' "$out_f"; then
-    sed -Ei \
-      -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' \
-      "$out_f" 2>/dev/null || true
-  fi
-
-  # Keys: polaris_access_token -> blackduck_api_token
-  if grep -Eq '^[[:space:]]*polaris_access_token:' "$out_f"; then
-    sed -Ei \
-      -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' \
-      "$out_f" 2>/dev/null || true
-  fi
-
-  # Cosmetic displayName updates
-  sed -Ei \
-    -e 's/Synopsys Bridge: Coverity on Polaris/Synopsys Bridge: Black Duck Coverity/g' \
-    -e 's/Black Duck Coverity on Polaris/Black Duck Coverity/g' \
-    "$out_f" 2>/dev/null || true
-}
-
 ado_apply_transform_azure_pipelines() {
   local rel="$1"
   local abs="$ROOT/$rel"
   [[ -f "$abs" ]] || return 1
 
-  # Only act if file contains SynopsysBridge@ or SynopsysSecurityScan@ or polaris markers
   if ! grep -Eq "SynopsysBridge@|SynopsysSecurityScan@|polaris" -- "$abs"; then
     return 1
   fi
 
   local tmp
   tmp="$(mktemp)"
-  ado_transform_content "$abs" "$tmp"
+  cp -f "$abs" "$tmp"
+
+  sed -Ei \
+    -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
+    -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
+    -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
+    "$tmp" 2>/dev/null || true
+
+  sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$tmp" 2>/dev/null || true
+
+  if grep -Eq '^[[:space:]]*polaris_server_url:' "$tmp"; then
+    sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$tmp" 2>/dev/null || true
+  fi
+
+  if grep -Eq '^[[:space:]]*polaris_access_token:' "$tmp"; then
+    sed -Ei -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' "$tmp" 2>/dev/null || true
+  fi
+
+  sed -Ei \
+    -e 's/Synopsys Bridge: Coverity on Polaris/Synopsys Bridge: Black Duck Coverity/g' \
+    -e 's/Black Duck Coverity on Polaris/Black Duck Coverity/g' \
+    "$tmp" 2>/dev/null || true
 
   if cmp -s "$abs" "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
 
-  local backup_abs
-  if [[ "$rel" == *".yaml" ]]; then
-    backup_abs="$ROOT/azure-pipelines_backup.yaml"
-  else
-    backup_abs="$ROOT/azure-pipelines_backup.yml"
+  if [[ "$MODE" == "apply" ]]; then
+    local backup
+    if [[ "$abs" == *.yaml ]]; then
+      backup="$ROOT/azure-pipelines_backup.yaml"
+    else
+      backup="$ROOT/azure-pipelines_backup.yml"
+    fi
+
+    rm -f "$backup" || true
+    mv -f "$abs" "$backup"
+    cp -f "$tmp" "$abs"
+    rm -f "$tmp"
+    log "[APPLY] Updated $rel (backup: $(basename "$backup"))"
+    return 0
   fi
 
-  # Create fixed backup only if not already present (protect first original)
-  if [[ ! -f "$backup_abs" ]]; then
-    cp -f "$abs" "$backup_abs"
-    log "[APPLY] Created backup: $(basename "$backup_abs")"
-  else
-    log "[APPLY] Backup already exists, leaving as-is: $(basename "$backup_abs")"
-  fi
-
-  # Overwrite original file with migrated content
-  cp -f "$tmp" "$abs"
   rm -f "$tmp"
-  log "[APPLY] Updated $rel"
   return 0
 }
 
@@ -275,28 +217,22 @@ ado_rollback_transform_azure_pipelines() {
   local abs="$ROOT/$rel"
   [[ "$MODE" == "rollback" ]] || return 1
 
-  local backup_abs
-  if [[ "$rel" == *".yaml" ]]; then
-    backup_abs="$ROOT/azure-pipelines_backup.yaml"
+  local backup=""
+  if [[ "$abs" == *.yaml ]]; then
+    [[ -f "$ROOT/azure-pipelines_backup.yaml" ]] && backup="$ROOT/azure-pipelines_backup.yaml"
   else
-    backup_abs="$ROOT/azure-pipelines_backup.yml"
+    [[ -f "$ROOT/azure-pipelines_backup.yml" ]] && backup="$ROOT/azure-pipelines_backup.yml"
   fi
 
-  [[ -f "$backup_abs" ]] || return 1
+  [[ -n "$backup" ]] || return 1
 
-  # Delete migrated file
   if [[ -f "$abs" ]]; then
     rm -f "$abs"
-    log "[ROLLBACK] Deleted migrated: $rel"
+    log "[ROLLBACK] Deleted $rel"
   fi
 
-  # Restore backup -> original name
-  cp -f "$backup_abs" "$abs"
-  log "[ROLLBACK] Restored backup -> $rel"
-
-  # Delete the backup file (your requirement)
-  rm -f "$backup_abs"
-  log "[ROLLBACK] Deleted backup: $(basename "$backup_abs")"
+  mv -f "$backup" "$abs"
+  log "[ROLLBACK] Restored $(basename "$backup") -> $rel (backup removed)"
   return 0
 }
 
@@ -323,7 +259,6 @@ found_type_of() {
 
 append_csv_row() {
   local repo="$1" branch="$2" build_type="$3" pm="$4" rel="$5" ci="$6" found="$7" inv="$8" ev="$9" mig="${10}"
-
   {
     csv_escape "$repo"; echo -n ","
     csv_escape "$branch"; echo -n ","
@@ -345,28 +280,43 @@ migration_changes_for_file() {
 
   if [[ "$MODE" == "audit" ]]; then
     if grep -Eq "SynopsysBridge@" -- "$abs"; then
-      echo "Change SynopsysBridge Polaris inputs to Black Duck: bridge_build_type: blackduck; set blackduck_url: \$(BLACKDUCK_URL); set blackduck_api_token: \$(BLACKDUCK_TOKEN). Verify credentials/variables."
+      echo "Replace SynopsysBridge polaris inputs with Black Duck inputs: bridge_build_type: blackduck; blackduck_url: \$(BLACKDUCK_URL); blackduck_api_token: \$(BLACKDUCK_TOKEN). Update displayName if needed."
       return
     fi
     if grep -Eq "SynopsysSecurityScan@" -- "$abs"; then
-      echo "Replace SynopsysSecurityScan@* (scanType: polaris) with BlackDuckSecurityScan@* (scanType: blackduck) or your org's Black Duck ADO task; verify service connection fields."
+      echo "Replace SynopsysSecurityScan@* (scanType: polaris) with BlackDuckSecurityScan@* (scanType: blackduck) OR your org's Black Duck ADO task. Validate service connection fields."
       return
     fi
-    echo "Detected Synopsys/Polaris/Coverity markers. Review and migrate to Black Duck / Coverity-in-Polaris per org standards."
+    echo "Detected Synopsys/Polaris/Coverity markers. Review and migrate to Black Duck / Coverity patterns as per org standards."
     return
   fi
 
   if [[ "$MODE" == "dry-run" ]]; then
-    local before tmp after d
+    local tmp transformed d
     tmp="$(mktemp)"
-    ado_transform_content "$abs" "$tmp"
-    d="$(diff -u "$abs" "$tmp" | head -n 200 || true)"
-    rm -f "$tmp"
+    transformed="$(mktemp)"
+    cp -f "$abs" "$tmp"
+    cp -f "$tmp" "$transformed"
+
+    sed -Ei \
+      -e 's/(\-\s*task:\s*)SynopsysSecurityScan@([0-9]+)/\1BlackDuckSecurityScan@\2/g' \
+      -e "s/(scanType:[[:space:]]*)'polaris'/\1'blackduck'/g" \
+      -e 's/(displayName:[[:space:]]*")Synopsys Polaris/\1Black Duck/g' \
+      "$transformed" 2>/dev/null || true
+    sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$transformed" 2>/dev/null || true
+    if grep -Eq '^[[:space:]]*polaris_server_url:' "$transformed"; then
+      sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$transformed" 2>/dev/null || true
+    fi
+    if grep -Eq '^[[:space:]]*polaris_access_token:' "$transformed"; then
+      sed -Ei -e 's/^[[:space:]]*polaris_access_token:.*$/      blackduck_api_token: "$(BLACKDUCK_TOKEN)"/' "$transformed" 2>/dev/null || true
+    fi
+
+    d="$(diff -u "$tmp" "$transformed" | head -n 200 || true)"
+    rm -f "$tmp" "$transformed"
     echo "${d:-NO_DIFF}"
     return
   fi
 
-  # apply/rollback: keep short note
   echo ""
 }
 
@@ -377,7 +327,6 @@ set_remote_with_token_for_push() {
   url="$(git -C "$ROOT" config --get "remote.${REMOTE}.url" || true)"
   [[ -n "$url" ]] || die "remote.${REMOTE}.url not found"
 
-  # Only rewrite https://github.com/... URLs; if already tokenized, keep.
   if [[ "$url" =~ ^https://github.com/ ]]; then
     local authed="https://x-access-token:${GITHUB_TOKEN}@github.com/${url#https://github.com/}"
     git -C "$ROOT" remote set-url "$REMOTE" "$authed"
@@ -388,17 +337,7 @@ commit_and_push_if_needed() {
   local branch="$1"; shift
   local paths=("$@")
 
-  # Determine whether anything changed among the specified paths
-  local any_changes=0
-  for p in "${paths[@]}"; do
-    if [[ -f "$ROOT/$p" || -f "$ROOT/$p" ]]; then
-      if ! git -C "$ROOT" diff --quiet -- "$p" 2>/dev/null; then
-        any_changes=1
-      fi
-    fi
-  done
-
-  if [[ "$any_changes" -eq 0 ]]; then
+  if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet; then
     log "[INFO] No changes applied on $branch; skipping commit/push."
     return 0
   fi
@@ -411,8 +350,7 @@ commit_and_push_if_needed() {
   git -C "$ROOT" config user.email "azure-pipelines@local" || true
   git -C "$ROOT" config user.name "azure-pipelines" || true
 
-  # Stage only pipeline/config files provided
-  git -C "$ROOT" add -- "${paths[@]}" || true
+  git -C "$ROOT" add -A -- "${paths[@]}" || true
 
   if git -C "$ROOT" diff --cached --quiet; then
     log "[INFO] Nothing staged; skipping commit/push."
@@ -432,9 +370,7 @@ commit_and_push_if_needed() {
 main() {
   assert_inputs
 
-  # Normalize OUT_CSV to absolute if it isn't (prevents double-prefix bugs)
   if [[ "$OUT_CSV" != /* ]]; then OUT_CSV="$(pwd)/$OUT_CSV"; fi
-
   ensure_csv_header
 
   local repo branch info build_type pm
@@ -444,9 +380,9 @@ main() {
   build_type="${info%%|*}"
   pm="${info#*|}"
 
+  local rel abs ci found inv ev mig
   local changed_paths=()
 
-  local rel abs ci found inv ev mig
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     abs="$ROOT/$rel"
@@ -462,43 +398,41 @@ main() {
 
     append_csv_row "$repo" "$branch" "$build_type" "$pm" "$rel" "$ci" "$found" "$inv" "$ev" "$mig"
 
-    # Apply/rollback actions (Azure pipelines only)
-    if [[ "$MODE" == "apply" && "$rel" =~ ^azure-pipelines\.ya?ml$ ]]; then
-      if ado_apply_transform_azure_pipelines "$rel"; then
-        changed_paths+=("$rel")
-        # fixed backup name
-        if [[ "$rel" == *".yaml" ]]; then
-          [[ -f "$ROOT/azure-pipelines_backup.yaml" ]] && changed_paths+=("azure-pipelines_backup.yaml")
-        else
-          [[ -f "$ROOT/azure-pipelines_backup.yml" ]] && changed_paths+=("azure-pipelines_backup.yml")
+    if [[ "$rel" =~ ^azure-pipelines\.ya?ml$ ]]; then
+      if [[ "$MODE" == "apply" ]]; then
+        if ado_apply_transform_azure_pipelines "$rel"; then
+          changed_paths+=("$rel")
+          if [[ "$rel" == "azure-pipelines.yaml" ]]; then
+            changed_paths+=("azure-pipelines_backup.yaml")
+          else
+            changed_paths+=("azure-pipelines_backup.yml")
+          fi
         fi
-      fi
-    fi
-
-    if [[ "$MODE" == "rollback" && "$rel" =~ ^azure-pipelines\.ya?ml$ ]]; then
-      if ado_rollback_transform_azure_pipelines "$rel"; then
-        changed_paths+=("$rel")
-        # backup deleted; do not stage it
+      elif [[ "$MODE" == "rollback" ]]; then
+        if ado_rollback_transform_azure_pipelines "$rel"; then
+          changed_paths+=("$rel")
+          if [[ "$rel" == "azure-pipelines.yaml" ]]; then
+            changed_paths+=("azure-pipelines_backup.yaml")
+          else
+            changed_paths+=("azure-pipelines_backup.yml")
+          fi
+        fi
       fi
     fi
 
   done < <(list_pipeline_files)
 
-  # Commit/push only in apply/rollback
   if [[ "$MODE" == "apply" || "$MODE" == "rollback" ]]; then
     if [[ ${#changed_paths[@]} -gt 0 ]]; then
-      # De-dup paths
       local uniq=()
       local seen="|"
-      local p
       for p in "${changed_paths[@]}"; do
         [[ -n "$p" ]] || continue
         if [[ "$seen" != *"|$p|"* ]]; then
-          seen="${seen}${p}|"
+          seen+="$p|"
           uniq+=("$p")
         fi
       done
-
       commit_and_push_if_needed "$branch" "${uniq[@]}"
     else
       log "[INFO] No changes applied on $branch; skipping commit/push."
@@ -507,9 +441,6 @@ main() {
 
   log "Done."
   log "CSV: $OUT_CSV"
-  if [[ "$MODE" == "apply" ]]; then
-    log "Backup file: azure-pipelines_backup.yml/.yaml (fixed name)"
-  fi
 }
 
 main "$@"
