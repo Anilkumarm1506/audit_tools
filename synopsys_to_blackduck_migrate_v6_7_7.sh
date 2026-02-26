@@ -99,25 +99,62 @@ current_branch() {
 }
 
 build_info_of_repo() {
-  local bt="unknown"
-  local pm=()
+  local bt_list=()
+  local pm_list=()
 
-  [[ -f "$ROOT/package.json" ]] && pm+=("package.json")
-  [[ -f "$ROOT/pom.xml" ]] && pm+=("pom.xml")
-  [[ -f "$ROOT/build.gradle" ]] && pm+=("build.gradle")
-  [[ -f "$ROOT/Dockerfile" ]] && pm+=("Dockerfile")
+  # Search recursively for package managers / build files
+  mapfile -t files < <(
+    cd "$ROOT" && \
+    find . -type f \( \
+        -name "package.json" -o \
+        -name "pom.xml" -o \
+        -name "build.gradle" -o \
+        -name "Dockerfile" \
+    \) | sort -u
+  )
 
-  if [[ -f "$ROOT/package.json" ]]; then bt="npm"; fi
-  if [[ -f "$ROOT/pom.xml" ]]; then bt="${bt/unknown/}maven${bt:+ +$bt}"; fi
-  if [[ -f "$ROOT/build.gradle" ]]; then bt="${bt/unknown/}gradle${bt:+ +$bt}"; fi
-  if [[ -f "$ROOT/Dockerfile" ]]; then bt="${bt/unknown/}docker${bt:+ +$bt}"; fi
+  for f in "${files[@]}"; do
+    case "$f" in
+      *package.json*)
+        bt_list+=("npm")
+        pm_list+=("${f#./}")
+        ;;
+      *pom.xml*)
+        bt_list+=("maven")
+        pm_list+=("${f#./}")
+        ;;
+      *build.gradle*)
+        bt_list+=("gradle")
+        pm_list+=("${f#./}")
+        ;;
+      *Dockerfile*)
+        bt_list+=("docker")
+        pm_list+=("${f#./}")
+        ;;
+    esac
+  done
 
+  # Deduplicate
+  if [[ ${#bt_list[@]} -gt 0 ]]; then
+    mapfile -t bt_list < <(printf "%s\n" "${bt_list[@]}" | sort -u)
+  fi
+  if [[ ${#pm_list[@]} -gt 0 ]]; then
+    mapfile -t pm_list < <(printf "%s\n" "${pm_list[@]}" | sort -u)
+  fi
+
+  # Join lists
+  local bt_join="unknown"
   local pm_join="none"
-  if [[ ${#pm[@]} -gt 0 ]]; then pm_join="$(IFS='; '; echo "${pm[*]}")"; fi
 
-  echo "$bt|$pm_join"
+  if [[ ${#bt_list[@]} -gt 0 ]]; then
+    bt_join="$(IFS=' +'; echo "${bt_list[*]}")"
+  fi
+  if [[ ${#pm_list[@]} -gt 0 ]]; then
+    pm_join="$(IFS=';'; echo "${pm_list[*]}")"
+  fi
+
+  echo "$bt_join|$pm_join"
 }
-
 ci_type_of_path() {
   local p="$1"
   case "$p" in
