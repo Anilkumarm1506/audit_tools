@@ -2,18 +2,18 @@
 set -euo pipefail
 
 # ============================================================================
-# Script: synopsys_to_blackduck_migrate_v6_7_6.sh
+# Script: synopsys_to_blackduck_migrate_v6_7_7.sh
 # Purpose:
 #   Audit / Dry-run / Apply / Rollback Synopsys (Polaris / Coverity-on-Polaris)
 #   configurations to Black Duck / Coverity patterns across common CI files.
 #
-# v6_7_6 updates:
-#   - Dry-run CSV "migration_changes" now omits diff headers (---/+++/@@).
-#   - Apply & Dry-run: Update polarisService URL domain
+# v6_7_7 updates:
+#   - Dry-run CSV "migration_changes": show only +/- changed lines (no headers, no context).
+#   - Apply & Dry-run: Rewrite polarisService URL
 #       https://<tenant>.polaris.synopsys.com  -->  https://<tenant>.polaris.blackduck.com
 #   - Normalize doubled quotes in displayName (""Title"") -> "Title".
 #
-# v6_7_5 (previous) fixes:
+# v6_7_5 baseline:
 #   - Rollback removes backup from the repo by moving it back into place and
 #     staging deletion via `git add -A -- <paths>`.
 #
@@ -170,7 +170,7 @@ ado_common_transforms() {
   # Bridge build type if present
   sed -Ei -e 's/(bridge_build_type:[[:space:]]*)"polaris"/\1"blackduck"/g' "$file" 2>/dev/null || true
 
-  # If legacy keys appear, rewrite to Black Duck analogs (rare in this path)
+  # Legacy keys to Black Duck (rare in this path)
   if grep -Eq '^[[:space:]]*polaris_server_url:' "$file"; then
     sed -Ei -e 's/^[[:space:]]*polaris_server_url:.*$/      blackduck_url: "$(BLACKDUCK_URL)"/' "$file" 2>/dev/null || true
   fi
@@ -184,12 +184,10 @@ ado_common_transforms() {
     -e 's/Black Duck Coverity on Polaris/Black Duck Coverity/g' \
     "$file" 2>/dev/null || true
 
-  # *** NEW: Update polarisService URL domain if a URL is provided (POC cases) ***
-  # Example: polarisService: 'https://yourorg.polaris.synopsys.com'  ->  https://yourorg.polaris.blackduck.com
+  # Update polarisService URL domain if a URL is provided (POC cases)
   sed -Ei -e 's#(polarisService:[[:space:]]*["'\'']?)https://([A-Za-z0-9._-]+)\.polaris\.synopsys\.com#\1https://\2.polaris.blackduck.com#g' "$file" 2>/dev/null || true
 
-  # *** NEW: Normalize doubled quotes in displayName ***
-  # From: displayName: ""Black Duck SAST Scan""  -> displayName: "Black Duck SAST Scan"
+  # Normalize doubled quotes in displayName
   sed -Ei \
     -e 's/(displayName:[[:space:]]*)"([^"]*)""/\1"\2"/g' \
     -e 's/(displayName:[[:space:]]*)""/\1"/g' \
@@ -201,7 +199,7 @@ ado_apply_transform_azure_pipelines() {
   local abs="$ROOT/$rel"
   [[ -f "$abs" ]] || return 1
 
-  # Only attempt if Synopsys/Polaris markers appear (broad match includes 'polaris' token)
+  # Only attempt if Synopsys/Polaris markers appear
   if ! grep -Eq "SynopsysBridge@|SynopsysSecurityScan@|polaris" -- "$abs"; then
     return 1
   fi
@@ -326,10 +324,13 @@ migration_changes_for_file() {
     # Apply the same transforms we would in APPLY
     ado_common_transforms "$transformed"
 
-    # Create unified diff and strip header lines (--- / +++ / @@)
-    d="$(diff -u "$tmp" "$transformed" \
-        | sed '/^--- /d; /^\+\+\+ /d; /^@@/d' \
-        | head -n 200 || true)"
+    # Create unified diff, then keep ONLY +/- changed lines (drop headers & context)
+    d="$(
+      diff -u "$tmp" "$transformed" \
+      | sed -E '/^--- |^\+\+\+ |^@@/d; /^[[:space:]]/d; /^[+-]$/d' \
+      | head -n 200 || true
+    )"
+
     rm -f "$tmp" "$transformed"
     echo "${d:-NO_DIFF}"
     return
