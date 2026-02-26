@@ -2,18 +2,20 @@
 set -euo pipefail
 
 # ============================================================================
-# Script: synopsys_to_blackduck_migrate_v6_7_7.sh 
+# Script: synopsys_to_blackduck_migrate_v6_7_7.sh (Option A aggregation, coverity_cli found_type)
 # Purpose:
 #   Audit / Dry-run / Apply / Rollback Synopsys (Polaris / Coverity-on-Polaris)
 #   configurations to Black Duck / Coverity patterns across common CI files.
 #
-# v6_7_7 updates:
+# v6_7_7 updates (plus Option A + fixes):
 #   - Dry-run CSV "migration_changes": show only +/- changed lines (no headers, no context).
 #   - Apply & Dry-run: Rewrite polarisService URL
 #       https://<tenant>.polaris.synopsys.com  -->  https://<tenant>.polaris.blackduck.com
 #   - Normalize doubled quotes in displayName (""Title"") -> "Title".
 #   - **Option A**: In audit & dry-run modes, **aggregate to a single CSV row per branch**
 #       (per repo). Multi-value columns are deduped and joined.
+#   - **Fix**: Safe associative-array reads with ${arr[key]:-} under `set -u`.
+#   - **Enhancement**: Explicit found_type=coverity_cli when Coverity CLI detected. invocation_style=coverity_cli remains.
 #
 # v6_7_5 baseline:
 #   - Rollback removes backup from the repo by moving it back into place and
@@ -50,7 +52,7 @@ PAT_ADO_TASK='SynopsysSecurityScan@|BlackDuckSecurityScan@|SynopsysBridge@'
 PAT_GHA_ACTION='uses:\s*synopsys-sig/synopsys-action'
 PAT_BRIDGE_CLI='(^|[[:space:]/])bridge([[:space:]]|$)|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|--input[[:space:]]+bridge\.ya?ml'
 PAT_COVERITY_CLI='cov-build|cov-analyze|cov-capture|cov-commit-defects|cov-format-errors'
-PAT_JENKINS_PLUGIN='withCoverityEnv|coverityScan|coverityPublisher|covBuild|covAnalyze|covCommitDefects'
+PAT_POLARIS_ANY='polaris|SynopsysSecurityScan@|SynopsysBridge@|synopsys-sig/synopsys-action|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck'
 
 PIPELINE_GLOBS=(
   ".travis.yml"
@@ -197,7 +199,7 @@ invocation_style_of_file() {
 
 evidence_of_file() {
   local f="$1"
-  local pat='polaris|coverity|SynopsysSecurityScan@|SynopsysBridge@|BlackDuckSecurityScan@|synopsys-sig/synopsys-action|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|cov-build|cov-analyze|cov-commit-defects'
+  local pat="polaris|coverity|SynopsysSecurityScan@|SynopsysBridge@|BlackDuckSecurityScan@|synopsys-sig/synopsys-action|--stage[[:space:]]+polaris|--stage[[:space:]]+blackduck|cov-build|cov-analyze|cov-commit-defects"
   awk -v pat="$pat" '
     BEGIN{c=0}
     { if($0 ~ pat){ c++; printf("%d: %s;", NR, $0); if(c>=30) exit } }
@@ -249,30 +251,30 @@ accumulate_row() {
 
   # build_type: join with " + "
   if [[ -n "$build_type" && "$build_type" != "unknown" ]]; then
-    AGG_build_type["$key"]="$(merge_list "${AGG_build_type[$key]}" "$(echo "$build_type" | sed 's/ \+/ /g')" " +")"
+    AGG_build_type["$key"]="$(merge_list "${AGG_build_type[$key]:-}" "$(echo "$build_type" | sed 's/ \+/ /g')" " +")"
   fi
 
   # package_manager_file: ";" separated
   pm="$(normalize_list "$pm")"
   if [[ -n "$pm" && "$pm" != "none" ]]; then
-    AGG_pm_files["$key"]="$(merge_list "${AGG_pm_files[$key]}" "$pm" ";")"
+    AGG_pm_files["$key"]="$(merge_list "${AGG_pm_files[$key]:-}" "$pm" ";")"
   fi
 
   # file_path
-  AGG_file_paths["$key"]="$(add_unique "${AGG_file_paths[$key]}" "$rel" ";")"
+  AGG_file_paths["$key"]="$(add_unique "${AGG_file_paths[$key]:-}" "$rel" ";")"
 
   # ci_type
-  AGG_ci_types["$key"]="$(add_unique "${AGG_ci_types[$key]}" "$ci" ";")"
+  AGG_ci_types["$key"]="$(add_unique "${AGG_ci_types[$key]:-}" "$ci" ";")"
 
   # found_type
-  if [[ "$found" == "direct" ]]; then
-    AGG_found_type["$key"]="direct"
+  if [[ "$found" == "direct" || "$found" == "coverity_cli" ]]; then
+    AGG_found_type["$key"]="$found"
   else
     [[ -z "${AGG_found_type[$key]:-}" ]] && AGG_found_type["$key"]="none"
   fi
 
   # invocation_style
-  AGG_inv_styles["$key"]="$(add_unique "${AGG_inv_styles[$key]}" "$inv" ";")"
+  AGG_inv_styles["$key"]="$(add_unique "${AGG_inv_styles[$key]:-}" "$inv" ";")"
 
   # evidence: split by ';', dedupe on " | " joiner, truncate to ~60 pieces total
   if [[ -n "$ev" ]]; then
@@ -294,7 +296,7 @@ accumulate_row() {
 
   # migration_changes (for dry-run these are +/- lines)
   if [[ -n "$mig" ]]; then
-    AGG_migration_changes["$key"]="$(add_unique "${AGG_migration_changes[$key]}" "$mig" " || ")"
+    AGG_migration_changes["$key"]="$(add_unique "${AGG_migration_changes[$key]:-}" "$mig" " || ")"
   fi
 }
 
@@ -448,7 +450,13 @@ list_pipeline_files() {
 
 found_type_of() {
   local abs="$1"
-  if grep -Eq 'polaris|coverity|SynopsysSecurityScan@|SynopsysBridge@|synopsys-sig/synopsys-action|cov-build|cov-analyze|cov-commit-defects|--stage[[:space:]]+polaris' -- "$abs"; then
+  # Explicit Coverity CLI classification first
+  if grep -Eq "$PAT_COVERITY_CLI" -- "$abs"; then
+    echo "coverity_cli"
+    return
+  fi
+  # Polaris / Bridge / Synopsys tasks etc.
+  if grep -Eq "$PAT_POLARIS_ANY" -- "$abs"; then
     echo "direct"
   else
     echo "none"
@@ -584,7 +592,7 @@ main() {
 
     ci="$(ci_type_of_path "$rel")"
     found="$(found_type_of "$abs")"
-    [[ "$found" == "direct" ]] || continue
+    [[ "$found" != "none" ]] || continue
 
     inv="$(invocation_style_of_file "$abs")"
     ev="$(evidence_of_file "$abs")"
