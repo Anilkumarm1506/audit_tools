@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Script: synopsys_to_blackduck_migrate_v6_7_7.sh
+# Script: synopsys_to_blackduck_migrate_v6_7_7.sh 
 # Purpose:
 #   Audit / Dry-run / Apply / Rollback Synopsys (Polaris / Coverity-on-Polaris)
 #   configurations to Black Duck / Coverity patterns across common CI files.
@@ -12,14 +12,17 @@ set -euo pipefail
 #   - Apply & Dry-run: Rewrite polarisService URL
 #       https://<tenant>.polaris.synopsys.com  -->  https://<tenant>.polaris.blackduck.com
 #   - Normalize doubled quotes in displayName (""Title"") -> "Title".
+#   - **Option A**: In audit & dry-run modes, **aggregate to a single CSV row per branch**
+#       (per repo). Multi-value columns are deduped and joined.
 #
 # v6_7_5 baseline:
 #   - Rollback removes backup from the repo by moving it back into place and
 #     staging deletion via `git add -A -- <paths>`.
 #
 # Modes:
-#   MODE=audit      : scan & write CSV findings only
+#   MODE=audit      : scan & write CSV findings (one row per branch with Option A)
 #   MODE=dry-run    : scan & write CSV + include proposed diff as last column
+#                     (one row per branch with Option A)
 #   MODE=apply      : write changes + create azure-pipelines_backup.yml(.yaml) + (optional) commit/push
 #   MODE=rollback   : restore from azure-pipelines_backup.yml(.yaml) and DELETE backup + (optional) commit/push
 #
@@ -155,6 +158,7 @@ build_info_of_repo() {
 
   echo "$bt_join|$pm_join"
 }
+
 ci_type_of_path() {
   local p="$1"
   case "$p" in
@@ -200,6 +204,132 @@ evidence_of_file() {
   ' "$f" | sed 's/[[:space:]]\+/ /g; s/;$/ /'
 }
 
+# -------- Aggregation for audit & dry-run (Option A) --------
+# We aggregate to a single row per repo+branch, deduping list-like fields.
+
+declare -A AGG_build_type
+declare -A AGG_pm_files
+declare -A AGG_file_paths
+declare -A AGG_ci_types
+declare -A AGG_found_type
+declare -A AGG_inv_styles
+declare -A AGG_evidence
+declare -A AGG_migration_changes
+
+# Append val to sep-joined list if not already present
+add_unique() {
+  local current="$1" val="$2" sep="${3:-;}"
+  [[ -z "$val" ]] && { echo "$current"; return; }
+  case "$current" in
+    "$val"|"$val$sep"*|*"$sep$val$sep"*|*"$sep$val") echo "$current"; return ;;
+  esac
+  if [[ -z "$current" ]]; then echo "$val"; else echo "$current$sep$val"; fi
+}
+
+merge_list() {
+  local current="$1" list="$2" sep="${3:-;}"
+  local out="$current"
+  IFS="$sep" read -r -a arr <<< "$list"
+  for it in "${arr[@]}"; do
+    [[ -n "$it" ]] || continue
+    out="$(add_unique "$out" "$it" "$sep")"
+  done
+  echo "$out"
+}
+
+normalize_list() {
+  local s="$1"
+  s="$(echo "$s" | sed -E 's/[[:space:]]*;[[:space:]]*/;/g; s/[[:space:]]+/ /g')"
+  echo "$s"
+}
+
+accumulate_row() {
+  local repo="$1" branch="$2" build_type="$3" pm="$4" rel="$5" ci="$6" found="$7" inv="$8" ev="$9" mig="${10}"
+  local key="${repo}|${branch}"
+
+  # build_type: join with " + "
+  if [[ -n "$build_type" && "$build_type" != "unknown" ]]; then
+    AGG_build_type["$key"]="$(merge_list "${AGG_build_type[$key]}" "$(echo "$build_type" | sed 's/ \+/ /g')" " +")"
+  fi
+
+  # package_manager_file: ";" separated
+  pm="$(normalize_list "$pm")"
+  if [[ -n "$pm" && "$pm" != "none" ]]; then
+    AGG_pm_files["$key"]="$(merge_list "${AGG_pm_files[$key]}" "$pm" ";")"
+  fi
+
+  # file_path
+  AGG_file_paths["$key"]="$(add_unique "${AGG_file_paths[$key]}" "$rel" ";")"
+
+  # ci_type
+  AGG_ci_types["$key"]="$(add_unique "${AGG_ci_types[$key]}" "$ci" ";")"
+
+  # found_type
+  if [[ "$found" == "direct" ]]; then
+    AGG_found_type["$key"]="direct"
+  else
+    [[ -z "${AGG_found_type[$key]:-}" ]] && AGG_found_type["$key"]="none"
+  fi
+
+  # invocation_style
+  AGG_inv_styles["$key"]="$(add_unique "${AGG_inv_styles[$key]}" "$inv" ";")"
+
+  # evidence: split by ';', dedupe on " | " joiner, truncate to ~60 pieces total
+  if [[ -n "$ev" ]]; then
+    local cur="${AGG_evidence[$key]:-}"
+    IFS=';' read -r -a evs <<< "$ev"
+    for e in "${evs[@]}"; do
+      e="$(echo "$e" | sed 's/^\s\+//; s/\s\+$//')"
+      [[ -z "$e" ]] && continue
+      cur="$(add_unique "$cur" "$e" " | ")"
+    done
+    # Truncate if too long
+    IFS='|' read -r -a parts <<< "$cur"
+    if (( ${#parts[@]} > 60 )); then
+      cur="$(printf "%s|" "${parts[@]:0:60}")...TRUNC"
+      cur="${cur%|}"
+    fi
+    AGG_evidence["$key"]="$cur"
+  fi
+
+  # migration_changes (for dry-run these are +/- lines)
+  if [[ -n "$mig" ]]; then
+    AGG_migration_changes["$key"]="$(add_unique "${AGG_migration_changes[$key]}" "$mig" " || ")"
+  fi
+}
+
+flush_aggregates_to_csv() {
+  ensure_csv_header
+  local key repo branch
+  for key in "${!AGG_found_type[@]}"; do
+    repo="${key%%|*}"
+    branch="${key#*|}"
+
+    local build_type="${AGG_build_type[$key]:-unknown}"
+    local pm="${AGG_pm_files[$key]:-none}"
+    local file_paths="${AGG_file_paths[$key]:-}"
+    local ci_types="${AGG_ci_types[$key]:-unknown}"
+    local found="${AGG_found_type[$key]:-none}"
+    local inv_styles="${AGG_inv_styles[$key]:-unknown}"
+    local evidence="${AGG_evidence[$key]:-}"
+    local mig="${AGG_migration_changes[$key]:-}"
+
+    {
+      csv_escape "$repo"; echo -n ","
+      csv_escape "$branch"; echo -n ","
+      csv_escape "$build_type"; echo -n ","
+      csv_escape "$pm"; echo -n ","
+      csv_escape "$file_paths"; echo -n ","
+      csv_escape "$ci_types"; echo -n ","
+      echo -n "$found,"
+      csv_escape "$inv_styles"; echo -n ","
+      csv_escape "$evidence"; echo -n ","
+      csv_escape "$mig"
+      echo
+    } >> "$OUT_CSV"
+  done
+}
+
 # ---------------- Azure pipeline transform logic ----------------
 # Common transforms used by both dry-run and apply
 ado_common_transforms() {
@@ -230,7 +360,7 @@ ado_common_transforms() {
     "$file" 2>/dev/null || true
 
   # Update polarisService URL domain if a URL is provided (POC cases)
-  sed -Ei -e 's#(polarisService:[[:space:]]*["'\'']?)https://([A-Za-z0-9._-]+)\.polaris\.synopsys\.com#\1https://\2.polaris.blackduck.com#g' "$file" 2>/dev/null || true
+  sed -Ei -e 's#(polarisService:[[:space:]]*["'"'"']?)https://([A-Za-z0-9._-]+)\.polaris\.synopsys\.com#\1https://\2.polaris.blackduck.com#g' "$file" 2>/dev/null || true
 
   # Normalize doubled quotes in displayName
   sed -Ei \
@@ -348,7 +478,7 @@ migration_changes_for_file() {
 
   if [[ "$MODE" == "audit" ]]; then
     if grep -Eq "SynopsysBridge@" -- "$abs"; then
-      echo "Replace SynopsysBridge polaris inputs with Black Duck inputs: bridge_build_type: blackduck; blackduck_url: \$(BLACKDUCK_URL); blackduck_api_token: \$(BLACKDUCK_TOKEN). Update displayName if needed."
+      echo "Replace SynopsysBridge polaris inputs with Black Duck inputs: bridge_build_type: blackduck; blackduck_url: $(BLACKDUCK_URL); blackduck_api_token: $(BLACKDUCK_TOKEN). Update displayName if needed."
       return
     fi
     if grep -Eq "SynopsysSecurityScan@" -- "$abs"; then
@@ -460,7 +590,13 @@ main() {
     ev="$(evidence_of_file "$abs")"
     mig="$(migration_changes_for_file "$rel")"
 
-    append_csv_row "$repo" "$branch" "$build_type" "$pm" "$rel" "$ci" "$found" "$inv" "$ev" "$mig"
+    if [[ "$MODE" == "audit" || "$MODE" == "dry-run" ]]; then
+      # Aggregate to single row per repo|branch (Option A)
+      accumulate_row "$repo" "$branch" "$build_type" "$pm" "$rel" "$ci" "$found" "$inv" "$ev" "$mig"
+    else
+      # Preserve per-file rows in apply/rollback
+      append_csv_row "$repo" "$branch" "$build_type" "$pm" "$rel" "$ci" "$found" "$inv" "$ev" "$mig"
+    fi
 
     if [[ "$rel" =~ ^azure-pipelines\.ya?ml$ ]]; then
       if [[ "$MODE" == "apply" ]]; then
@@ -503,8 +639,14 @@ main() {
     fi
   fi
 
+  # Write one row per repo|branch (aggregated) for audit/dry-run
+  if [[ "$MODE" == "audit" || "$MODE" == "dry-run" ]]; then
+    flush_aggregates_to_csv
+  fi
+
   log "Done."
   log "CSV: $OUT_CSV"
 }
 
 main "$@"
+
