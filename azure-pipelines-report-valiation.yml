@@ -1,1 +1,62 @@
-##
+parameters:
+- name: oldProjectId
+  type: string
+  default: ''
+- name: newProjectId
+  type: string
+  default: ''
+- name: codeRepoBranch
+  type: string
+  default: 'main'
+ 
+jobs:
+- job: PolarisMigrationValidation
+  displayName: "Polaris Migration Validation"
+  pool:
+    vmImage: "ubuntu-latest"
+ 
+  variables:
+    PAGE_SIZE: "500"
+    LINE_TOLERANCE: "1"
+    OUTPUT_DIR: "$(Build.SourcesDirectory)/polaris_compare_output"
+ 
+  steps:
+  - checkout: self
+    displayName: "Checkout source"
+ 
+  - task: Bash@3
+    displayName: "Run file-based Polaris migration validation script"
+    env:
+      OLD_BASE_URL: $(OLD_BASE_URL)
+      OLD_API_TOKEN: $(OLD_API_TOKEN)
+ 
+      NEW_BASE_URL: $(NEW_BASE_URL)
+      NEW_API_TOKEN: $(NEW_API_TOKEN)
+ 
+      PAGE_SIZE: $(PAGE_SIZE)
+      LINE_TOLERANCE: $(LINE_TOLERANCE)
+      OUTPUT_DIR: $(OUTPUT_DIR)
+ 
+      OLD_AUTH_MODE: $(OLD_AUTH_MODE)
+      NEW_AUTH_MODE: $(NEW_AUTH_MODE)
+ 
+      OLD_AUTH_ENDPOINT: $(OLD_AUTH_ENDPOINT)
+      NEW_AUTH_ENDPOINT: $(NEW_AUTH_ENDPOINT)
+ 
+      OLD_ISSUES_ENDPOINT: $(OLD_ISSUES_ENDPOINT)
+      NEW_ISSUES_ENDPOINT: $(NEW_ISSUES_ENDPOINT)
+ 
+    inputs:
+      targetType: "filePath"
+      filePath: "$(Build.SourcesDirectory)/scripts/polaris_migration_validation_enterprise.sh"
+      arguments: >
+        "${{ parameters.oldProjectId }}"
+        "${{ parameters.newProjectId }}"
+        "${{ parameters.codeRepoBranch }}"
+ 
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish migration validation artifacts"
+    inputs:
+      targetPath: "$(OUTPUT_DIR)"
+      artifact: "polaris-migration-validation"
+      publishLocation: "pipeline"
