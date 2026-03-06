@@ -1,0 +1,67 @@
+# .azure-pipelines/compare-sast.yml
+# Runs compare_sast.sh and publishes the resulting HTML.
+# Supply the branch that contains the old/new scan reports.
+
+trigger: none  # run manually or hook to your needs
+
+pr: none
+
+parameters:
+  - name: scanBranch
+    displayName: "Branch containing SAST reports (in the reports repo)"
+    type: string
+    default: "migration_report"
+
+  - name: outputHtml
+    displayName: "Output HTML filename"
+    type: string
+    default: "sast_comparison.html"
+
+  - name: repoUrl
+    displayName: "Git repo URL that hosts the SAST CSV reports"
+    type: string
+    default: "https://github.com/Anilkumarm1506/audit_tools.git"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  # Optional: override if your script is in a subfolder
+  scriptPath: "compare_sast.sh"
+
+stages:
+  - stage: Compare
+    displayName: "Compare SAST Reports"
+    jobs:
+      - job: RunComparison
+        displayName: "Run comparison and publish report"
+        steps:
+          - checkout: self
+            displayName: "Checkout pipeline repo (contains compare_sast.sh)"
+
+          - task: Bash@3
+            displayName: "Make script executable"
+            inputs:
+              targetType: "inline"
+              script: |
+                chmod +x "$(scriptPath)"
+                echo "compare_sast.sh is executable."
+
+          - task: Bash@3
+            displayName: "Run compare_sast.sh"
+            inputs:
+              targetType: "inline"
+              script: |
+                set -euo pipefail
+                ./$(scriptPath) \
+                  -r "${{ parameters.repoUrl }}" \
+                  -b "${{ parameters.scanBranch }}" \
+                  -o "${{ parameters.outputHtml }}"
+                echo "Generated: ${{ parameters.outputHtml }}"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish HTML report"
+            inputs:
+              targetPath: "${{ parameters.outputHtml }}"
+              artifact: "sast-comparison-report"
+              publishLocation: "pipeline"
