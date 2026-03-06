@@ -1,0 +1,7 @@
+Issue ID,Checker,CWE,Severity,Impact,File Path,Function,Line,Component,Language,Introduced In Commit,Status,First Detected,Last Seen,Occurrences,Short Description,Recommendation
+COV-2000,SQL_INJECTION,89,Critical,Security,src/main/java/com/acme/db/UserDAO.java,findByUsername,45,AuthService,Java,aa11bb22,New,2026-02-28,2026-02-28,1,Untrusted input flows into SQL query.,Use prepared statements with bind variables.
+COV-2001,COMMAND_INJECTION,78,High,Security,src/main/java/com/acme/auth/LoginController.java,login,88,AuthService,Java,bb22cc33,New,2026-02-28,2026-02-28,1,Shell command constructed with user input.,Use ProcessBuilder with explicit args; validate/escape input.
+COV-2002,WEAK_CRYPTO,327,High,Security,src/main/java/com/acme/security/HashUtil.java,md5,29,Security,Java,cc33dd44,Existing,2026-02-10,2026-02-28,2,MD5 used for password hashing.,Switch to bcrypt/Argon2 or SHA-256 with salt+pepper.
+COV-2003,RESOURCE_LEAK,772,Medium,Reliability,src/main/java/com/acme/db/DbClient.java,query,98,Core,Java,dd44ee55,Existing,2026-02-15,2026-02-28,3,ResultSet not closed in error path.,Use try-with-resources for DB objects.
+COV-2004,NULL_DEREF,476,Medium,Reliability,src/main/java/com/acme/service/OrderService.java,submit,210,Order,Java,ee55ff66,New,2026-02-28,2026-02-28,1,Possible null dereference.,Add null checks or use Optional.
+COV-2005,HARDCODED_SECRET,798,Low,Security,src/main/resources/application.properties,<global>,12,Config,Config,ff66gg77,Existing,2026-02-05,2026-02-28,1,API key present in config.,Move secrets to vault/ENV; rotate the key.
