@@ -1,0 +1,161 @@
+# Azure Pipelines for SAST comparison (Coverity vs Polaris)
+# Requires: compare_sast_api.sh in repo root (executable)
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+pr:
+  branches:
+    include:
+      - "*"
+
+parameters:
+  - name: projectId
+    type: string
+    displayName: "Project ID (Coverity project name & Polaris project lookup key)"
+    default: ""
+  - name: branchMode
+    type: string
+    displayName: "Branch selection mode"
+    default: "both"
+    values:
+      - both       # pass --branch <name> to set both stacks the same
+      - separate  # pass --cov-branch and --pol-branch individually
+      - none      # do not pass branch flags (latest overall)
+  - name: covBranch
+    type: string
+    displayName: "Coverity stream/branch name (when branchMode=separate)"
+    default: ""
+  - name: polBranch
+    type: string
+    displayName: "Polaris branch name (when branchMode=separate)"
+    default: ""
+  - name: strictReportRequired
+    type: boolean
+    displayName: "Fail job if report is not produced"
+    default: true
+
+# Option A: put secrets into a Variable Group and uncomment:
+# variables:
+# - group: DevSecOps-Endpoints
+
+# Option B: define variables right here (mark secrets in the UI after first run):
+variables:
+  # COVERITY: Either COV_USER_PASS (user:pass) OR COVERITY_AUTH (base64 of user:pass)
+  COVERITY_URL: "$(COVERITY_URL)"
+  COV_USER_PASS: "$(COV_USER_PASS)"         # mark secret in Pipeline UI
+  COVERITY_AUTH: "$(COVERITY_AUTH)"         # mark secret if you use this instead of COV_USER_PASS
+
+  # POLARIS:
+  POLARIS_URL: "$(POLARIS_URL)"
+  POLARIS_TOKEN: "$(POLARIS_TOKEN)"         # mark secret in Pipeline UI
+
+  # Artifact name
+  REPORT_ARTIFACT: "sast-comparison-report"
+  REPORT_FILE: "comparison_report.html"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+- stage: compare_sast
+  displayName: "Compare SAST (Coverity vs Polaris)"
+  jobs:
+  - job: run_compare
+    displayName: "Run comparison & publish report"
+    steps:
+    - checkout: self
+      clean: true
+
+    - task: Bash@3
+      displayName: "Install jq (if missing)"
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+    - task: Bash@3
+      displayName: "Show environment info (sanitized)"
+      inputs:
+        targetType: inline
+        script: |
+          set -e
+          echo "Agent OS: $(uname -a)"
+          echo "Project ID: '${{ parameters.projectId }}'"
+          echo "Branch mode: '${{ parameters.branchMode }}'"
+          echo "Coverity URL set: $([ -n "$(COVERITY_URL)" ] && echo yes || echo no)"
+          echo "Polaris URL set: $([ -n "$(POLARIS_URL)" ] && echo yes || echo no)"
+          # Do not echo secrets
+
+    - task: Bash@3
+      displayName: "Run compare_sast_api.sh"
+      env:
+        COVERITY_URL: $(COVERITY_URL)
+        COV_USER_PASS: $(COV_USER_PASS)
+        COVERITY_AUTH: $(COVERITY_AUTH)
+        POLARIS_URL: $(POLARIS_URL)
+        POLARIS_TOKEN: $(POLARIS_TOKEN)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          chmod +x ./compare_sast_api.sh
+
+          # Assemble arguments based on branchMode
+          ARGS=""
+          case "${{ parameters.branchMode }}" in
+            both)
+              if [ -n "${SYSTEM_PULLREQUEST_TARGETBRANCH:-}" ]; then
+                # Azure DevOps PR: refs/heads/<name> → extract trailing name
+                BR="$(basename "${SYSTEM_PULLREQUEST_TARGETBRANCH}")"
+              else
+                # CI build: Build.SourceBranchName already has the short name
+                BR="${BUILD_SOURCEBRANCHNAME:-}"
+              fi
+              if [ -z "$BR" ]; then
+                echo "No branch name detected from pipeline context; please pass branchMode=separate or set --branch manually."
+                exit 1
+              fi
+              echo "Using same branch for both stacks: $BR"
+              ARGS="--branch \"$BR\""
+              ;;
+            separate)
+              COV_BR="${{ parameters.covBranch }}"
+              POL_BR="${{ parameters.polBranch }}"
+              [ -n "$COV_BR" ] || { echo "--cov-branch is required when branchMode=separate"; exit 1; }
+              [ -n "$POL_BR" ] || { echo "--pol-branch is required when branchMode=separate"; exit 1; }
+              echo "Using Coverity branch: $COV_BR"
+              echo "Using Polaris branch:  $POL_BR"
+              ARGS="--cov-branch \"$COV_BR\" --pol-branch \"$POL_BR\""
+              ;;
+            none)
+              echo "No branch filters; using latest snapshots/tests on both stacks."
+              ;;
+            *)
+              echo "Unsupported branchMode '${{ parameters.branchMode }}'"; exit 1;;
+          esac
+
+          echo "Executing: ./compare_sast_api.sh \"${{ parameters.projectId }}\" $ARGS"
+          # shellcheck disable=SC2086
+          eval ./compare_sast_api.sh "\"${{ parameters.projectId }}\"" $ARGS
+
+          if [ "${{ parameters.strictReportRequired }}" = "true" ]; then
+            [ -f "$(REPORT_FILE)" ] || { echo "ERROR: Report file '$(REPORT_FILE)' not produced."; exit 2; }
+          fi
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish comparison_report.html"
+      inputs:
+        PathtoPublish: "$(REPORT_FILE)"
+        ArtifactName: "$(REPORT_ARTIFACT)"
+        publishLocation: "Container"
+      condition: exists('$(REPORT_FILE)')
+``
